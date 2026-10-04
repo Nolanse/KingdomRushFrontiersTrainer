@@ -160,7 +160,7 @@ run_complete  →  写 slot.levels[idx].stars / already_won
 
 ### 下载即用（推荐普通用户）
 
-1. 前往 [Releases](../../releases) 下载 `KingdomRushFrontiersTrainer.exe`（约 10 MB）
+1. 前往仓库的 [Releases](../../releases/latest) 页面下载 `KingdomRushFrontiersTrainer.exe`（约 10 MB）
 2. 双击运行 —— **无需安装 Python 或任何依赖**
 3. 顶部「版本检查」变绿即表示已自动找到游戏
 4. 点「启动 / 连接游戏」，等待显示「桥接状态：已连接」
@@ -175,10 +175,15 @@ run_complete  →  写 slot.levels[idx].stars / already_won
 git clone https://github.com/<你的用户名>/KingdomRushFrontiersTrainer.git
 cd KingdomRushFrontiersTrainer
 
-# 建议使用 Python 3.9+（开发环境：3.12）
-python -m pip install -r requirements.txt   # 目前仅打包时需要
+# 运行界面（需标准版 Python，自带 tkinter）
 python KingdomRushFrontiersTrainer.pyw
+
+# 可选：安装打包依赖（仅在自行构建 exe 时需要）
+python -m pip install -r requirements.txt
 ```
+
+> 首次运行后，程序会自动把桥接脚本写入
+> `%APPDATA%\kingdom_rush_frontiers`，无需手工复制。
 
 ---
 
