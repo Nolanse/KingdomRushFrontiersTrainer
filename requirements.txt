@@ -1,0 +1,13 @@
+# Kingdom Rush Frontiers Trainer —— 依赖说明
+#
+# 运行发布版 exe 不需要任何依赖（已内置 Python 运行时与桥接脚本）。
+# 以下仅在「从源码运行」或「自行打包」时需要。
+
+# --- 打包（可选，仅自行构建 exe 时需要）---
+pyinstaller>=6.0
+
+# --- 说明 ---
+# 界面使用标准库 tkinter，无需 pip 安装，但要求 Python 本身带 tkinter。
+# 运行测试需要本机已安装 Kingdom Rush Frontiers（会加载游戏自带的 lua51.dll）。
+#
+# 本项目零网络请求，不依赖任何 HTTP / API / 数据库类库。
