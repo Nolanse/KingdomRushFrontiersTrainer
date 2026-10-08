@@ -133,6 +133,46 @@ check("关闭只读：开关恢复可用",
 check("关闭只读：原值被恢复（gems 仍开）", app.state["gems_enabled"] is True,
       f"= {app.state['gems_enabled']}")
 
+# --- 回归：只读开关的原值备份曾被自身覆盖，导致关闭只读后快捷键失效 ---
+# 场景：开 gems -> 进只读 -> 出只读 -> 用快捷键开 unlock_levels
+# 注：需 backup_done=True，否则 ensure_backup 会因临时目录无 slot_*.lua 而回滚开关
+#     （那是备份保护的正确行为，与本回归无关）
+app.backup_done = True
+for k in app.SLOT_FEATURES:          # 先归零，避免受前序用例影响
+    app.state[k] = False
+    app.toggles[k].set(False)
+app.toggles["gems_enabled"].set(True)
+app.on_toggle()
+app.toggles["read_only"].set(True)
+app.on_toggle()
+app.toggles["read_only"].set(False)
+app.on_toggle()
+check("回归：出只读后 gems 原值保留", app.toggles["gems_enabled"].get() is True,
+      f"= {app.toggles['gems_enabled'].get()}")
+app._toggle_from_hotkey("unlock_levels")
+check("回归：关闭只读后快捷键可用", app.state["unlock_levels"] is True,
+      f"= {app.state['unlock_levels']}")
+
+# 连续多次开关只读不应把已清零值当成原值
+app.toggles["three_stars"].set(True)
+app.on_toggle()
+for _ in range(3):
+    app.toggles["read_only"].set(True); app.on_toggle()
+    app.toggles["read_only"].set(False); app.on_toggle()
+check("回归：3 轮开关后 three_stars 保留",
+      app.toggles["three_stars"].get() is True,
+      f"= {app.toggles['three_stars'].get()}")
+
+# 全关状态下进出只读，不应误开
+for k in app.SLOT_FEATURES:
+    app.state[k] = False
+    app.toggles[k].set(False)
+app.on_toggle()
+app.toggles["read_only"].set(True); app.on_toggle()
+app.toggles["read_only"].set(False); app.on_toggle()
+check("回归：全关状态进出只读不误开",
+      not any(app.toggles[k].get() for k in app.SLOT_FEATURES))
+
 app.shutdown()
 txt2 = (app.save_dir / m.STATE_FILE).read_text(encoding="utf-8")
 check("退出时 active=false", "active = false" in txt2)

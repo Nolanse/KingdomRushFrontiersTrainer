@@ -32,7 +32,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Kingdom Rush Frontiers 专用修改器"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 APP_BUILD_DATE = "2026-10-03"
 APP_CREDITS = f"v{APP_VERSION} · {APP_BUILD_DATE}"
 
@@ -780,8 +780,8 @@ class TrainerApp:
         # 每个开关对应的 Checkbutton 控件（只读模式需要禁用）
         self._toggle_widgets: dict[str, ttk.Checkbutton] = {}
         self._slot_widgets: dict[str, ttk.Checkbutton] = {}
-        # 只读模式切换前后的开关原值，用于恢复
-        self._slot_backup: dict[str, bool] = {k: False for k in self.SLOT_FEATURES}
+        # 只读模式切换前的开关原值（None = 当前未处于备份态）
+        self._slot_backup: dict[str, bool | None] = {k: None for k in self.SLOT_FEATURES}
         self.hotkeys: dict[str, str] = dict(DEFAULT_HOTKEYS)
 
         self.save_dir = choose_save_dir()
@@ -1223,18 +1223,26 @@ class TrainerApp:
     SLOT_FEATURES = ("gems_enabled", "unlock_levels", "three_stars")
 
     def refresh_read_only_ui(self) -> None:
-        """只读模式下禁用三个存档类开关并给出说明。"""
+        """只读模式下禁用三个存档类开关并给出说明。
+
+        原值只在**首次进入只读**时记录一次（_slot_backup 为空哨兵 None），
+        之后反复切换不会把已清零的值当成"用户原意"覆盖掉。
+        """
         ro = bool(self.state.get("read_only"))
         for key in self.SLOT_FEATURES:
             var = self.toggles.get(key)
             if var is None:
                 continue
             if ro:
-                self._slot_backup[key] = bool(var.get())
+                # 仅在首次进入时备份；已备份过就保留最初的用户设置
+                if self._slot_backup.get(key) is None:
+                    self._slot_backup[key] = bool(var.get())
                 var.set(False)
             else:
-                var.set(self._slot_backup.get(key, False))
-            # ttk.Checkbutton 通过 state 属性控制可用性
+                saved = self._slot_backup.get(key)
+                var.set(bool(saved) if saved is not None else False)
+                # 恢复后清掉备份，下次进入只读时重新记录
+                self._slot_backup[key] = None
             self._slot_widgets[key].configure(state="disabled" if ro else "normal")
         if ro:
             self.read_only_hint.configure(
