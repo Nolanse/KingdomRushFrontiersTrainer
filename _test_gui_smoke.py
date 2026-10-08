@@ -173,6 +173,44 @@ app.toggles["read_only"].set(False); app.on_toggle()
 check("回归：全关状态进出只读不误开",
       not any(app.toggles[k].get() for k in app.SLOT_FEATURES))
 
+# ---- 回归：数值序列化精度 ----
+# 曾使用 format(v, ".6g")，只有 6 位有效数字：
+#   999999999 -> "1e+09"（变 10 亿）、123456789 -> "1.23457e+08"（偏差 343 万）
+# 金币 / 宝石这类大数值会被直接改坏。
+check("回归：金币上限原样输出", m.lua_literal(999999999.0) == "999999999",
+      f"= {m.lua_literal(999999999.0)}")
+check("回归：大数值不丢精度", m.lua_literal(123456789.0) == "123456789",
+      f"= {m.lua_literal(123456789.0)}")
+check("回归：整值倍率不带小数点", m.lua_literal(3.0) == "3", f"= {m.lua_literal(3.0)}")
+check("回归：小数保持可读", m.lua_literal(2.5) == "2.5", f"= {m.lua_literal(2.5)}")
+if os.path.isfile(_lua51):
+    literal = m.lua_literal(999999999.0)
+    check("回归：Lua 回读金币上限一致", ex("return " + literal) == "999999999",
+          f"= {ex('return ' + literal)}")
+
+# ---- 回归：一次性命令 nonce 不跨会话恢复 ----
+# 否则重启修改器后，新游戏进程里桥接的 last_* 从 0 起算，
+# 会把上次点击的计数当成新请求，一进关卡就自动「立即通关」。
+app.state["cmd_win"] = 7
+app.state["cmd_skip_wave"] = 3
+app.save_config()
+app.load_config()
+check("回归：重启后 cmd_win 归零", app.state["cmd_win"] == 0, f"= {app.state['cmd_win']}")
+check("回归：重启后 cmd_skip_wave 归零", app.state["cmd_skip_wave"] == 0,
+      f"= {app.state['cmd_skip_wave']}")
+check("回归：重启后 cmd_force_wave 归零", app.state["cmd_force_wave"] == 0,
+      f"= {app.state['cmd_force_wave']}")
+
+# ---- 回归：同一秒内连续备份不冲突 ----
+# 目录名只到秒，第二次 mkdir 曾抛 FileExistsError 并被误报为「备份失败并取消修改」。
+(app.save_dir / "slot_1.lua").write_text("return {}\n", encoding="utf-8")
+b1 = app.backup_saves("regress")
+b2 = app.backup_saves("regress")
+check("回归：同秒首次备份成功", b1 is not None and b1.is_dir(), f"= {b1}")
+check("回归：同秒二次备份成功", b2 is not None and b2.is_dir(), f"= {b2}")
+check("回归：两次备份目录互不相同",
+      b1 is not None and b2 is not None and b1 != b2, f"= {b1} vs {b2}")
+
 app.shutdown()
 txt2 = (app.save_dir / m.STATE_FILE).read_text(encoding="utf-8")
 check("退出时 active=false", "active = false" in txt2)

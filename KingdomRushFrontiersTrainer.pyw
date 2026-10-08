@@ -32,23 +32,43 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Kingdom Rush Frontiers 专用修改器"
-APP_VERSION = "1.2.1"
-APP_BUILD_DATE = "2026-10-03"
+APP_VERSION = "1.3.1"
+APP_BUILD_DATE = "2026-10-08"
 APP_CREDITS = f"v{APP_VERSION} · {APP_BUILD_DATE}"
 
 # ---- 目标游戏参数（Frontiers = KR2，2026-10 实机提取确认）----
 TARGET_EXE_NAME = "Kingdom Rush Frontiers.exe"
 TARGET_VERSION_PREFIX = "kr2-desktop-"
 TARGET_BUNDLE_ID = "com.ironhidegames.frontiers.windows.steam"
+# appmanifest 扫不到时的兜底 AppID。
+# 游戏本体是带 steam_api.dll 的 Steam 构建、但目录不在 steamapps\common 下时
+# （第三方渠道 / 绿色版 / 手动拷贝 / 库目录被移动），缺少 SteamAppId 会让
+# steam_api.dll 初始化失败、进程 1-2 秒静默退出，因此按已知 AppID 兜底注入。
+KNOWN_STEAM_APP_ID = 458710
+# 非 Steam 库安装时的额外探测位置（相对 %USERPROFILE%），只扫两层
+NON_STEAM_SEARCH_ROOTS = ("Desktop", "Downloads", "Documents")
+NON_STEAM_SEARCH_DEPTH = 2
+NON_STEAM_SEARCH_LIMIT = 800
 # identity = kingdom_rush_frontiers -> LÖVE 存档目录名
 SAVE_DIR_NAME = "kingdom_rush_frontiers"
 # 主线关卡 1..22（kr2/data/levels/ 下另有 level81/82/99 特殊关，不计入）
 FALLBACK_LAST_LEVEL = 22
 
+# 进程识别：① 精确同名 → ② 归一化同名（忽略空格/大小写/.exe）→ ③ 关键字兜底。
+# ③ 用于适配 exe 被改名、或经启动器间接拉起的非官方构建；
+# 命中 PROCESS_NAME_EXCLUDE 的候选（Steam / 启动器 / 安装器）一律排除，避免误连。
+PROCESS_NAME_KEYWORD = "frontiers"
+PROCESS_NAME_EXCLUDE = ("steam", "loader", "launcher", "setup", "install",
+                        "unins", "crash", "report", "helper", "update",
+                        "trainer")
+
 BRIDGE_MODULE = "krft_bridge"
 BRIDGE_FILE = "krft_bridge.lua"
 STATE_FILE = "krft_state.lua"
 STATUS_FILE = "krft_status.txt"
+# 一次性命令的单调递增计数。桥接靠「本次值 > 上次值」判断是不是新请求，
+# 因此这几个值绝不能跨会话持久化（详见 TrainerApp.load_config）。
+COMMAND_NONCES = ("cmd_skip_wave", "cmd_force_wave", "cmd_win")
 GAME_WINDOW_TITLE_HINT = "Frontiers"
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -162,15 +182,82 @@ def candidate_save_dirs() -> list[Path]:
     ]
 
 
-def choose_save_dir() -> Path:
-    candidates = candidate_save_dirs()
-    for path in candidates:
-        if path.exists() and (any(path.glob("slot_*.lua")) or (path / "settings.lua").exists()):
+# 判定一个目录「像不像本作存档目录」的特征文件
+SAVE_DIR_MARKERS = ("settings.lua", "global.lua", "krft_state.lua", "krft_status.txt")
+
+
+def discover_save_dirs() -> list[Path]:
+    """列出本作可能使用的全部存档目录，按可能性从高到低。
+
+    除标准 identity 目录外，额外扫描 %APPDATA%\\LOVE\\* 与 %APPDATA%\\*kingdom*：
+    改了 bundle id / identity 的非官方构建会把存档落到别的目录名下，
+    只认死 SAVE_DIR_NAME 会出现「桥接写了文件，界面却读不到」的假死。
+    """
+    appdata = Path(os.environ.get("APPDATA", Path.home()))
+    found: list[Path] = []
+
+    def add(path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved not in found:
+            found.append(resolved)
+
+    for path in candidate_save_dirs():
+        add(path)
+    for pattern in ("LOVE/*", "*kingdom*", "*frontiers*"):
+        try:
+            for child in sorted(appdata.glob(pattern)):
+                if child.is_dir():
+                    add(child)
+        except OSError:
+            continue
+    return found
+
+
+def save_dir_score(path: Path) -> int:
+    """目录的「本作存档目录」可信度；-1 表示目录不存在。"""
+    try:
+        if not path.is_dir():
+            return -1
+    except OSError:
+        return -1
+    score = 0
+    try:
+        if any(path.glob("slot_*.lua")):
+            score += 4
+    except OSError:
+        pass
+    for name in SAVE_DIR_MARKERS:
+        try:
+            if (path / name).exists():
+                score += 1
+        except OSError:
+            continue
+    return score
+
+
+def choose_save_dir(override: str | Path | None = None) -> Path:
+    """选出本次会话使用的存档目录。
+
+    优先级：override（launch.json 的 save_dir）→ 特征打分最高者 → 标准 identity 目录。
+    打分全为 0 时保持旧行为（优先存在的标准目录），绝不返回误导性的新目录。
+    """
+    if override:
+        text = str(override).strip().strip('"')
+        if text:
+            return Path(text).expanduser()
+    for path in sorted(discover_save_dirs(), key=save_dir_score, reverse=True):
+        if save_dir_score(path) > 0:
             return path
-    for path in candidates:
-        if path.exists():
-            return path
-    return candidates[0]
+    for path in candidate_save_dirs():
+        try:
+            if path.is_dir():
+                return path
+        except OSError:
+            continue
+    return candidate_save_dirs()[0]
 
 
 def steam_library_dirs() -> list[Path]:
@@ -255,10 +342,44 @@ def locate_default_game() -> Path:
                 candidates.append(match)
         except OSError:
             continue
+    # Steam 库外还有一份副本时（第三方渠道 / 绿色版 / 手动拷贝），
+    # 只在 Steam 库里找不到时才启用，避免抢掉正常安装的优先级
+    if not any(p.is_file() for p in candidates):
+        candidates.extend(scan_non_steam_roots())
     for path in candidates:
         if path.is_file():
             return path
     return candidates[0] if candidates else Path(TARGET_EXE_NAME)
+
+
+def scan_non_steam_roots() -> list[Path]:
+    """在桌面 / 下载 / 文档下找不在 Steam 库里的安装副本。
+
+    只按文件名匹配、只扫两层、命中数有上限，代价可控。
+    找不到就返回空列表，绝不因为扫描失败影响正常启动。
+    """
+    found: list[Path] = []
+    try:
+        home = Path.home()
+    except (OSError, RuntimeError):
+        return found
+    for name in NON_STEAM_SEARCH_ROOTS:
+        root = home / name
+        try:
+            if not root.is_dir():
+                continue
+        except OSError:
+            continue
+        for depth in range(1, NON_STEAM_SEARCH_DEPTH + 1):
+            pattern = "/".join(["*"] * depth) + f"/{TARGET_EXE_NAME}"
+            try:
+                for match in sorted(root.glob(pattern)):
+                    found.append(match)
+                    if len(found) >= NON_STEAM_SEARCH_LIMIT:
+                        return found
+            except OSError:
+                continue
+    return found
 
 
 def visible_window_titles(pid: int) -> list[str]:
@@ -284,7 +405,8 @@ def visible_window_titles(pid: int) -> list[str]:
     return titles
 
 
-def find_process_ids(exe_name: str) -> list[int]:
+def list_processes() -> list[tuple[int, str]]:
+    """枚举当前全部进程，返回 [(pid, exe 名)]。"""
     if os.name != "nt":
         return []
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -300,26 +422,75 @@ def find_process_ids(exe_name: str) -> list[int]:
     snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if snapshot == INVALID_HANDLE_VALUE:
         return []
-    found: list[int] = []
+    result: list[tuple[int, str]] = []
     entry = PROCESSENTRY32W()
     entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
     try:
         if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
-            return found
+            return result
         while True:
-            if entry.szExeFile.lower() == exe_name.lower():
-                found.append(int(entry.th32ProcessID))
+            result.append((int(entry.th32ProcessID), str(entry.szExeFile)))
             if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
                 break
     finally:
         kernel32.CloseHandle(snapshot)
-    return found
+    return result
+
+
+def normalize_process_name(name: str) -> str:
+    """归一化进程名：去 .exe，去空格 / 点 / 下划线 / 连字符，转小写。"""
+    stem = str(name or "").strip().lower()
+    if stem.endswith(".exe"):
+        stem = stem[:-4]
+    return re.sub(r"[\s._\-]+", "", stem)
+
+
+def process_match_tier(exe_name: str, target: str = TARGET_EXE_NAME) -> int:
+    """进程名匹配分级：0=不匹配 1=关键字兜底 2=归一化同名 3=精确同名（越大越可信）。"""
+    name = str(exe_name or "").strip()
+    if not name:
+        return 0
+    if name.lower() == target.lower():
+        return 3
+    normalized = normalize_process_name(name)
+    if normalized and normalized == normalize_process_name(target):
+        return 2
+    if any(word in normalized for word in PROCESS_NAME_EXCLUDE):
+        return 0
+    if PROCESS_NAME_KEYWORD and PROCESS_NAME_KEYWORD in normalized:
+        return 1
+    return 0
+
+
+def find_game_processes(target: str = TARGET_EXE_NAME) -> list[tuple[int, str]]:
+    """分层匹配游戏进程，返回 [(pid, exe 名)]。
+
+    只返回最高命中的那一层：存在精确同名进程时，绝不把模糊命中的启动器一起混进来。
+    同时排除当前修改器自身进程，避免单文件 exe 名字含 "Frontiers" 时把自己误判为游戏。
+    """
+    ranked: dict[int, list[tuple[int, str]]] = {}
+    own_pid = os.getpid()
+    for pid, name in list_processes():
+        if pid == own_pid:
+            continue
+        tier = process_match_tier(name, target)
+        if tier:
+            ranked.setdefault(tier, []).append((pid, name))
+    if not ranked:
+        return []
+    return ranked[max(ranked)]
+
+
+def find_process_ids(exe_name: str = TARGET_EXE_NAME) -> list[int]:
+    return [pid for pid, _ in find_game_processes(exe_name)]
 
 
 def detect_steam_app_id(game_path: Path) -> int | None:
     """从 appmanifest 识别 Frontiers 的 AppID（用于注入 Steam 运行上下文）。
 
     优先按 installdir 指向的目录精确匹配，匹配不到再按 name 找 Frontiers。
+    目录不在 Steam 库内时（第三方渠道 / 绿色版 / 手动拷贝 / 库目录被移动过），
+    退化为「本体是否带 steam_api.dll」判断，命中则注入已知 AppID。
     """
     try:
         game_dir = game_path.resolve().parent
@@ -331,7 +502,10 @@ def detect_steam_app_id(game_path: Path) -> int | None:
             steamapps = candidate
             break
     if steamapps is None:
-        return None
+        # 只对本作主程序兜底，避免把 AppID 注入到名字碰巧含关键字的无关进程
+        if PROCESS_NAME_KEYWORD not in normalize_process_name(game_path.name):
+            return None
+        return KNOWN_STEAM_APP_ID if looks_like_steam_build(game_dir) else None
     by_folder: int | None = None
     by_name: int | None = None
     for manifest in sorted(steamapps.glob("appmanifest_*.acf")):
@@ -353,7 +527,25 @@ def detect_steam_app_id(game_path: Path) -> int | None:
                 pass
         if re.search(r'"name"\s+"Kingdom Rush Frontiers"', text):
             by_name = app_id
-    return by_folder or by_name
+    if by_folder or by_name:
+        return by_folder or by_name
+    # 不在 Steam 库内：appmanifest 扫不到，回退到「本体是否带 steam_api.dll」这一客观事实。
+    # 只对本作主程序生效，避免把 AppID 注入到名字碰巧含关键字的无关进程。
+    if PROCESS_NAME_KEYWORD not in normalize_process_name(game_path.name):
+        return None
+    return KNOWN_STEAM_APP_ID if looks_like_steam_build(game_dir) else None
+
+
+# Steam 运行上下文的客观标志：安装目录里有 steam_api.dll / steam_api64.dll
+STEAM_API_DLLS = ("steam_api.dll", "steam_api64.dll")
+
+
+def looks_like_steam_build(game_dir: Path) -> bool:
+    """目录里带 steam_api*.dll → 该构建需要 Steam 运行上下文才能启动。"""
+    try:
+        return any((game_dir / dll).is_file() for dll in STEAM_API_DLLS)
+    except OSError:
+        return False
 
 
 def steam_launch_env(game_path: Path) -> dict[str, str]:
@@ -388,6 +580,7 @@ def parse_game_binary(path: Path) -> dict[str, object]:
         "platform": "未知",
         "size": 0,
         "custom_script": False,
+        "version_exact": False,
         "reason": "",
     }
     try:
@@ -441,6 +634,12 @@ def parse_game_binary(path: Path) -> dict[str, object]:
         match = re.search((TARGET_VERSION_PREFIX + r"(\d+\.\d+\.\d+)").encode(), version_blob)
         if match:
             result["version"] = match.group(1).decode("ascii")
+            result["version_exact"] = True
+        elif b"kr2" in version_blob:
+            # 改过 bundle id / 版本串前缀的非标准构建：退化匹配任意 x.y.z
+            loose = re.search(rb"(\d+\.\d+\.\d+)", version_blob)
+            if loose:
+                result["version"] = loose.group(1).decode("ascii")
         result["platform"] = "Windows / Steam" if b"windows-steam" in version_blob else "Windows"
         result["bundle_ok"] = TARGET_BUNDLE_ID.encode() in version_blob
         # -custom_script 是整个方案的前提，必须确认
@@ -463,7 +662,12 @@ def lua_literal(value: object) -> str:
     if isinstance(value, float):
         if not math.isfinite(value):
             value = 0.0
-        return format(value, ".6g")
+        # 不能用 ".6g"：它只有 6 位有效数字，会把 999999999 写成 1e+09（变成 10 亿）、
+        # 123456789 写成 1.23457e+08（偏差 343 万），金币/宝石这类大数值会被直接改坏。
+        # 整值按整数输出，其余用 repr 保证 round-trip 无损。
+        if value == int(value) and abs(value) < 2 ** 53:
+            return str(int(value))
+        return repr(value)
     if value is None:
         return "nil"
     escaped = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
@@ -532,8 +736,27 @@ def sample_launch_config() -> dict[str, object]:
         "steam_app_id": "",
         "extra_args": [],
         "use_steam_env": True,
-        "note": "game_path 留空则回退到自动探测；填 Steam 库外的非常规路径时必填",
+        "save_dir": "",
+        "note": "game_path 留空则回退到自动探测；填 Steam 库外的非常规路径时必填。"
+                "save_dir 留空则自动识别存档目录；非 Steam 构建可显式指定。"
+                "use_steam_env=false 时不注入 SteamAppId/SteamGameId。",
     }
+
+
+def launch_config_save_dir() -> Path | None:
+    """单独从 launch.json 取可选的 save_dir 覆盖，与 mode 是否生效无关。
+
+    存档目录是「文件实际落在哪里」的客观事实，不该受启动方式影响；
+    解析失败一律视为「未指定」，绝不因此阻断启动。
+    """
+    try:
+        data = json.loads(launch_config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    raw = str(data.get("save_dir", "")).strip().strip('"')
+    return Path(raw).expanduser() if raw else None
 
 
 def load_launch_config() -> tuple[dict[str, object] | None, str]:
@@ -578,13 +801,17 @@ def load_launch_config() -> tuple[dict[str, object] | None, str]:
 
     game_raw = str(data.get("game_path", "")).strip().strip('"')
     game = Path(game_raw).expanduser() if game_raw else None
+    save_raw = str(data.get("save_dir", "")).strip().strip('"')
 
     return {
         "mode": mode,
         "game": game,
         "steam_app_id": app_id,
         "extra_args": list(extra),
-        "use_steam_env": bool(data.get("use_steam_env", True)),
+        "use_steam_env": coerce_bool(data.get("use_steam_env", True), True),
+        # 区分「文件里显式写了」与「取默认值」：只有显式写了才覆盖界面开关
+        "use_steam_env_set": "use_steam_env" in data,
+        "save_dir": Path(save_raw).expanduser() if save_raw else None,
     }, ""
 
 
@@ -614,6 +841,21 @@ def safe_int(value, fallback: int = 0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return fallback
+
+
+def coerce_bool(value, fallback: bool = True) -> bool:
+    """宽松布尔解析：手写 JSON 里容易写成 "false" / "0" / "no"，不能当 True 用。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off", ""):
+            return False
+    return fallback
 
 
 def normalize_hotkey(text: str) -> str:
@@ -784,7 +1026,9 @@ class TrainerApp:
         self._slot_backup: dict[str, bool | None] = {k: None for k in self.SLOT_FEATURES}
         self.hotkeys: dict[str, str] = dict(DEFAULT_HOTKEYS)
 
-        self.save_dir = choose_save_dir()
+        # 配置必须先读：存档目录覆盖与两个兼容性开关都来自配置文件
+        self.load_config()
+        self.save_dir = choose_save_dir(getattr(self, "_saved_save_dir", None))
         self.game_path = locate_default_game()
         self.pid: int | None = None
         self.prepared = False
@@ -797,12 +1041,16 @@ class TrainerApp:
         self.last_heartbeat = 0.0
 
         self.game_path_var = tk.StringVar(value=str(self.game_path))
+        self.save_dir_var = tk.StringVar(value=str(self.save_dir))
         self.connection_var = tk.StringVar(value="未连接")
         self.bridge_var = tk.StringVar(value="桥接状态：未就绪")
         self.backup_label = tk.StringVar(value="尚未备份存档")
         self.status_text: tk.Text | None = None
+        # 兼容性开关：只决定「是否尝试启动」，不写入游戏状态文件
+        self.force_launch_var = tk.BooleanVar(value=bool(getattr(self, "_saved_force_launch", False)))
+        self.use_steam_env_var = tk.BooleanVar(
+            value=bool(getattr(self, "_saved_use_steam_env", True)))
 
-        self.load_config()
         self.configure_style()
         self.build_ui()
 
@@ -818,8 +1066,8 @@ class TrainerApp:
     # ---------- 样式 ----------
     def configure_style(self) -> None:
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
-        self.root.geometry("720x640")
-        self.root.minsize(680, 560)
+        self.root.geometry("740x700")
+        self.root.minsize(700, 620)
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
@@ -832,6 +1080,7 @@ class TrainerApp:
         style.configure("Muted.TLabel", background="#f5f6f8", foreground="#6b7280", font=("Microsoft YaHei UI", 8))
         style.configure("Good.TLabel", background="#f5f6f8", foreground="#15803d", font=("Microsoft YaHei UI", 9, "bold"))
         style.configure("Bad.TLabel", background="#f5f6f8", foreground="#b91c1c", font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("Warn.TLabel", background="#f5f6f8", foreground="#b45309", font=("Microsoft YaHei UI", 9, "bold"))
         style.configure("Status.TLabel", background="#f5f6f8", foreground="#1d4ed8", font=("Microsoft YaHei UI", 9, "bold"))
         style.configure("TCheckbutton", background="#f5f6f8", foreground="#1f2430", font=("Microsoft YaHei UI", 9))
         style.configure("Hotkey.TButton", font=("Microsoft YaHei UI", 8))
@@ -881,8 +1130,30 @@ class TrainerApp:
 
         self.version_label = ttk.Label(outer, text="版本检查：检查中…")
         self.version_label.pack(anchor="w", pady=(4, 0))
+
+        # 兼容性开关：非 Steam / 非常规构建的两个逃生口
+        compat = ttk.Frame(outer)
+        compat.pack(fill="x", pady=(3, 0))
+        ttk.Checkbutton(compat, text="忽略兼容性检查（非 Steam / 非常规构建）",
+                        variable=self.force_launch_var,
+                        command=self.on_compat_changed).pack(side="left")
+        ttk.Checkbutton(compat, text="注入 Steam 运行环境变量",
+                        variable=self.use_steam_env_var,
+                        command=self.on_compat_changed).pack(side="left", padx=(18, 0))
+
+        # 存档目录：桥接文件落点，非标准 identity 构建需要能看到并重检
+        save_row = ttk.Frame(outer)
+        save_row.pack(fill="x", pady=(3, 0))
+        ttk.Label(save_row, text="存档目录").pack(side="left")
+        ttk.Entry(save_row, textvariable=self.save_dir_var, state="readonly").pack(
+            side="left", fill="x", expand=True, padx=6)
+        ttk.Button(save_row, text="重新检测", style="Hotkey.TButton",
+                   command=self.redetect_save_dir).pack(side="left")
+        ttk.Button(save_row, text="打开", style="Hotkey.TButton",
+                   command=self.open_save_dir).pack(side="left", padx=(4, 0))
+
         conn = ttk.Frame(outer)
-        conn.pack(fill="x", pady=(2, 8))
+        conn.pack(fill="x", pady=(4, 8))
         ttk.Label(conn, textvariable=self.connection_var, style="Status.TLabel").pack(side="left")
         ttk.Label(conn, textvariable=self.bridge_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
 
@@ -1085,19 +1356,36 @@ class TrainerApp:
             for key, value in data["hotkeys"].items():
                 if key in DEFAULT_HOTKEYS and isinstance(value, str):
                     self.hotkeys[key] = normalize_hotkey(value) or DEFAULT_HOTKEYS[key]
+        # 一次性命令的 nonce 必须归零，绝不能跨会话恢复：
+        # 桥接侧 last_* 在新游戏进程里从 0 开始，若这里把上次点击的计数读回来，
+        # 会被当成新请求，玩家一进关卡就自动「提前呼叫下一波 / 立即通关」。
+        for key in COMMAND_NONCES:
+            self.state[key] = 0
         # 恢复启动方式；缺省时依据 launch.json 是否存在自动判断
         self._saved_launch_mode = data.get("launch_mode")
         if self._saved_launch_mode not in LAUNCH_MODE_CHOICES:
             self._saved_launch_mode = None
+        # 两个兼容性开关
+        self._saved_force_launch = coerce_bool(data.get("force_launch"), False)
+        self._saved_use_steam_env = coerce_bool(data.get("use_steam_env"), True)
+        # 存档目录覆盖只认 launch.json：把自己的探测结果回写成"硬绑定"会让目录一旦变动就失效
+        self._saved_save_dir = launch_config_save_dir()
 
     def save_config(self) -> None:
         try:
             path = self.config_file()
             path.parent.mkdir(parents=True, exist_ok=True)
             mode = self.launch_mode_var.get() if hasattr(self, "launch_mode_var") else LAUNCH_MODE_AUTO
-            atomic_write_text(path, json.dumps(
-                {"state": self.state, "hotkeys": self.hotkeys, "launch_mode": mode},
-                ensure_ascii=False, indent=2))
+            payload: dict[str, object] = {
+                "state": self.state,
+                "hotkeys": self.hotkeys,
+                "launch_mode": mode,
+            }
+            if hasattr(self, "force_launch_var"):
+                payload["force_launch"] = bool(self.force_launch_var.get())
+            if hasattr(self, "use_steam_env_var"):
+                payload["use_steam_env"] = bool(self.use_steam_env_var.get())
+            atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
         except OSError:
             pass
 
@@ -1202,8 +1490,22 @@ class TrainerApp:
             if not files:
                 self.log("未找到 slot_*.lua；当前可能尚未创建存档槽。")
                 return None
-            backup_dir = self.save_dir / "KRFTBackups" / datetime.now().strftime(f"%Y%m%d-%H%M%S-{reason}")
-            backup_dir.mkdir(parents=True, exist_ok=False)
+            stamp = datetime.now().strftime(f"%Y%m%d-%H%M%S-{reason}")
+            backup_dir = self.save_dir / "KRFTBackups" / stamp
+            # 目录名只精确到秒，同一秒内再备份一次（例如连点「手动备份存档」）
+            # 会让 mkdir 抛 FileExistsError，被当成「备份失败并取消修改」，属于误报。
+            # 冲突时追加序号，保证每次备份都能成功。
+            suffix = 0
+            while True:
+                candidate = backup_dir if suffix == 0 else backup_dir.with_name(f"{stamp}-{suffix}")
+                try:
+                    candidate.mkdir(parents=True, exist_ok=False)
+                    backup_dir = candidate
+                    break
+                except FileExistsError:
+                    suffix += 1
+                    if suffix > 99:
+                        raise
             for source in files:
                 shutil.copy2(source, backup_dir / source.name)
             atomic_write_text(backup_dir / "backup_manifest.json", json.dumps({
@@ -1217,7 +1519,7 @@ class TrainerApp:
             self.backup_label.set(f"最近备份：{backup_dir}")
             return backup_dir
         except OSError as exc:
-            messagebox.showerror(APP_NAME, f"存档备份失败，已取消修改：\n{exc}")
+            messagebox.showerror(APP_NAME, f"存档备份失败：\n{exc}")
             return None
 
     SLOT_FEATURES = ("gems_enabled", "unlock_levels", "three_stars")
@@ -1269,7 +1571,7 @@ class TrainerApp:
     @guarded
     def browse_game(self) -> None:
         selected = filedialog.askopenfilename(
-            title="选择 Kingdom Rush Frontiers.exe",
+            title="选择游戏主程序（Kingdom Rush Frontiers.exe）",
             filetypes=[("Kingdom Rush Frontiers", TARGET_EXE_NAME), ("可执行文件", "*.exe")])
         if selected:
             self.game_path = Path(selected)
@@ -1293,17 +1595,61 @@ class TrainerApp:
             self.version_cache_key = cache_key
             self.version_cache = result
         if result["valid"]:
+            extra = "" if result.get("version_exact") else " · 版本串非标准（非 Steam 构建）"
             self.version_label.configure(
-                text=f"版本检查：{result['version']} · {result['platform']} · {result['architecture']} · -custom_script 可用",
+                text=f"版本检查：{result['version']} · {result['platform']} · {result['architecture']}"
+                     f" · -custom_script 可用{extra}",
                 style="Good.TLabel")
         else:
             exists = self.game_path.is_file() if self.game_path else False
+            forced = bool(self.force_launch_var.get()) if hasattr(self, "force_launch_var") else False
             if not exists:
-                note = "版本检查：未找到游戏，请点击「浏览」选择 Kingdom Rush Frontiers.exe"
+                note = "版本检查：未找到游戏，请点击「浏览」选择游戏主程序"
+            elif forced:
+                note = f"版本检查：未通过（{result['reason']}）· 已勾选忽略，将直接尝试"
             else:
                 note = f"版本检查：不兼容或无法识别（{result['reason']}）"
-            self.version_label.configure(text=note, style="Bad.TLabel")
+            self.version_label.configure(
+                text=note, style="Warn.TLabel" if (exists and forced) else "Bad.TLabel")
         return result
+
+    @guarded
+    def on_compat_changed(self) -> None:
+        """兼容性开关变化：立刻刷新版本显示与启动方式说明。"""
+        self.check_version()
+        self.refresh_mode_hint()
+        self.save_config()
+        self.log("兼容性设置已更新：忽略检查={}，注入 Steam 环境={}".format(
+            "是" if self.force_launch_var.get() else "否",
+            "是" if self.use_steam_env_var.get() else "否"))
+
+    @guarded
+    def redetect_save_dir(self) -> None:
+        """重新扫描存档目录。
+
+        launch.json 里的 save_dir 优先级最高；没有覆盖时才按存档特征自动选择。
+        """
+        override = launch_config_save_dir()
+        previous = self.save_dir
+        self.save_dir = choose_save_dir(override)
+        self.save_dir_var.set(str(self.save_dir))
+        self.save_config()
+        if override:
+            self.log(f"已按 launch.json 的 save_dir 指定存档目录：{self.save_dir}")
+        if str(previous) == str(self.save_dir):
+            self.log(f"存档目录保持不变：{self.save_dir}")
+        else:
+            self.log(f"存档目录已更新：{previous} -> {self.save_dir}")
+            if self.prepared:
+                self.prepare_bridge()
+
+    @guarded
+    def open_save_dir(self) -> None:
+        try:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(self.save_dir))  # noqa: S606  (Windows 打开资源管理器)
+        except (OSError, AttributeError) as exc:
+            messagebox.showinfo(APP_NAME, f"存档目录：\n{self.save_dir}\n\n（无法自动打开：{exc}）")
 
     def detect_launch_mode(self) -> str:
         """默认选中的启动方式：优先用户上次的选择，其次看 launch.json 是否存在。"""
@@ -1319,15 +1665,19 @@ class TrainerApp:
         """刷新启动方式说明标签。"""
         path = launch_config_path()
         mode = self.launch_mode_var.get()
+        inject_ui = bool(self.use_steam_env_var.get()) if hasattr(self, "use_steam_env_var") else True
         if mode == LAUNCH_MODE_CONFIG:
             if path.is_file():
                 config, err = load_launch_config()
                 if config:
                     game = config["game"]
                     where = str(game) if game else "（未指定，将回退自动探测）"
+                    inject = (bool(config["use_steam_env"])
+                              if config.get("use_steam_env_set") else inject_ui)
                     self.mode_hint.configure(
                         text=f"方式一：将读取 {path.name} —— 目标 {where}；"
-                             f"附加参数 {config['extra_args'] or '无'}",
+                             f"附加参数 {config['extra_args'] or '无'}；"
+                             f"注入 Steam 环境 {'是' if inject else '否'}",
                         style="Good.TLabel")
                 else:
                     self.mode_hint.configure(
@@ -1338,7 +1688,8 @@ class TrainerApp:
                     style="Bad.TLabel")
         else:
             self.mode_hint.configure(
-                text="方式二：使用上方「游戏路径」，并自动识别 Steam AppID（458710）注入环境变量",
+                text="方式二：使用上方「游戏路径」；Steam 运行环境变量"
+                     f"（AppID 458710）注入：{'是' if inject_ui else '否'}",
                 style="Muted.TLabel")
 
     @guarded
@@ -1413,12 +1764,14 @@ class TrainerApp:
                 reason = f"无法定位可执行文件：{target}"
                 self.log(f"启动方式一不可用（{reason}），回退到自动探测。")
                 return self._auto_launch_plan(reason)
+            steam_on = (bool(config["use_steam_env"]) if config.get("use_steam_env_set")
+                        else bool(self.use_steam_env_var.get()))
             return {
                 "mode": LAUNCH_MODE_CONFIG,
                 "game": target,
                 "app_id": int(config["steam_app_id"]) or detect_steam_app_id(target),
                 "extra_args": list(config["extra_args"]),
-                "use_steam": bool(config["use_steam_env"]),
+                "use_steam": steam_on,
                 "fallback_reason": "" if game is not None else "配置未指定 game_path，已定位自动探测路径",
             }
 
@@ -1434,7 +1787,8 @@ class TrainerApp:
             "game": game,
             "app_id": 0,  # 由 build_launch_env 自动识别
             "extra_args": [],
-            "use_steam": True,
+            "use_steam": (bool(self.use_steam_env_var.get())
+                          if hasattr(self, "use_steam_env_var") else True),
             "fallback_reason": fallback_reason,
         }
 
@@ -1449,9 +1803,13 @@ class TrainerApp:
             self.game_path_var.set(str(game_path))
             result = self.check_version()
             if not result["valid"]:
-                if not messagebox.askyesno(
+                if self.force_launch_var.get():
+                    self.log(f"已勾选「忽略兼容性检查」，跳过确认：{result['reason']}")
+                elif not messagebox.askyesno(
                         APP_NAME,
-                        f"当前游戏文件未通过兼容性检查：\n{result['reason']}\n\n仍要准备桥接文件并尝试启动吗？"):
+                        f"当前游戏文件未通过兼容性检查：\n{result['reason']}\n\n"
+                        "仍要准备桥接文件并尝试启动吗？\n"
+                        "（非 Steam / 非常规构建可先勾选「忽略兼容性检查」）"):
                     return
         else:
             self.game_path = game_path
@@ -1464,21 +1822,35 @@ class TrainerApp:
         if not self.prepare_bridge():
             return
         self.save_config()
+        env = build_launch_env(game_path, int(plan["app_id"]), bool(plan["use_steam"]))
+        resolved_app_id = env.get("SteamAppId")
+        self.log(f"存档目录：{self.save_dir}；注入 Steam 环境：{'是' if plan['use_steam'] else '否'}"
+                 + (f"（AppID {resolved_app_id}）" if resolved_app_id else "（未能识别 AppID）"))
 
-        existing = find_process_ids(TARGET_EXE_NAME)
+        existing = find_game_processes()
         if existing:
+            pid, name = existing[0]
+            self.log(f"检测到游戏进程：{name}（PID {pid}，匹配层级 {process_match_tier(name)}）")
             status = self.read_bridge_status()
             if status.get("bridge") == "1" and self.status_fresh(status):
-                self.pid = existing[0]
-                self.log(f"已连接游戏进程 PID {existing[0]}。")
-                self.connection_var.set(f"已连接（PID {existing[0]}）")
+                self.pid = pid
+                self.log(f"已连接游戏进程 PID {pid}。")
+                self.connection_var.set(f"已连接（PID {pid}）")
                 return
-            messagebox.showwarning(APP_NAME, "游戏已在运行，但桥接未就绪。\n\n请完全退出游戏后重试。")
+            self.log(f"游戏进程 PID {pid} 未就绪：krft_status.txt 不存在、bridge≠1 或状态超时")
+            messagebox.showwarning(
+                APP_NAME,
+                f"检测到游戏进程已在运行（PID {pid}，{name}），但桥接未就绪。\n\n"
+                "常见原因：\n"
+                "1. 游戏不是由本修改器以 -custom_script krft_bridge 启动的；\n"
+                "2. 存档目录不一致，桥接文件未被游戏加载；\n"
+                "3. 当前游戏版本不支持 -custom_script 入口。\n\n"
+                "请完全退出游戏后重试。若使用第三方启动器，建议改用方式 B：\n"
+                "手动给游戏添加启动参数 -custom_script krft_bridge，再由修改器自动连接。")
             return
 
         args = [str(game_path), "-custom_script", BRIDGE_MODULE]
         args.extend(plan["extra_args"])
-        env = build_launch_env(game_path, int(plan["app_id"]), bool(plan["use_steam"]))
         label = "方式一（本地配置）" if mode == LAUNCH_MODE_CONFIG else "方式二（自动探测）"
         if plan["fallback_reason"]:
             self.log(f"本次以{label}启动；回退原因：{plan['fallback_reason']}")
@@ -1533,17 +1905,19 @@ class TrainerApp:
                 APP_NAME,
                 "等待桥接握手超时。\n\n请确认：\n"
                 "1. 游戏窗口已正常打开\n"
-                "2. 存档目录可写（%APPDATA%\\" + SAVE_DIR_NAME + "）")
+                f"2. 存档目录可写（{self.save_dir}）\n"
+                "3. 当前游戏版本包含 -custom_script 入口")
             return
-        if not find_process_ids(TARGET_EXE_NAME):
+        if not find_process_ids():
             self.connection_var.set("未连接")
             self.bridge_var.set("桥接状态：游戏已退出")
             messagebox.showwarning(
                 APP_NAME,
-                "游戏进程已退出。\n\n常见原因：\n"
-                "1. 未检测到 Steam AppID（游戏需 Steam 运行环境）\n"
+                "游戏进程已退出或未能识别。\n\n常见原因：\n"
+                "1. Steam 运行环境缺失（非 Steam 构建请关闭「注入 Steam 运行环境变量」）\n"
                 "2. 游戏已在另一个 Steam 客户端实例中运行\n"
-                "3. 启动参数不被当前版本接受")
+                "3. 当前版本缺少 -custom_script 入口\n"
+                "4. 进程名与预期差异较大，可在下方日志查看识别结果")
             return
         status = self.read_bridge_status()
         if status.get("bridge") == "1" and self.status_fresh(status):
@@ -1769,7 +2143,7 @@ class TrainerApp:
     def _poll_loop(self) -> None:
         try:
             now = time.time()
-            pids = find_process_ids(TARGET_EXE_NAME)
+            pids = find_process_ids()
             if pids:
                 if self.pid not in pids:
                     self.pid = pids[0]
@@ -1790,7 +2164,8 @@ class TrainerApp:
                 else:
                     self.connected = False
                     self.connection_var.set(f"游戏运行中（PID {self.pid}）· 未加载桥接")
-                    self.bridge_var.set("桥接状态：请用本程序启动游戏，或在 Steam 启动选项加 -custom_script krft_bridge")
+                    self.bridge_var.set(
+                        "桥接状态：请用本程序启动游戏，或给游戏加 -custom_script krft_bridge 启动参数")
             else:
                 if self.pid is not None:
                     self.log("检测到游戏进程已退出。")

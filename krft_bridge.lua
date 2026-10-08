@@ -492,28 +492,32 @@ local function apply_entities(store)
     local speed_multiplier = clamp_number(config.tower_speed_multiplier, 0.1, 50, 3)
     local range_multiplier = clamp_number(config.tower_range_multiplier, 0.1, 20, 2)
 
-    for _, entity in pairs(store.entities) do
-        if type(entity) == "table" then
-            local friendly = entity.tower or entity.hero or entity.soldier
-            if invincible and friendly and entity.health and not entity.health.dead
-                and type(entity.health.hp_max) == "number" then
-                remember_and_set("god", entity.health, "hp", entity.health.hp_max)
-            end
-            if no_cooldown and entity.hero then
-                recursive_scale_cooldowns("hero_cd", entity, 0, 5, {})
-            end
-            if tower_speed_enabled and entity.tower then
-                recursive_scale_cooldowns("tower_speed", entity, speed_multiplier, 4, {})
-            end
-            if tower_range_enabled and entity.tower then
-                set_range_fields(entity, range_multiplier)
-            end
-            if damage_enabled and friendly then
-                set_damage_fields(entity, damage_multiplier)
+    if type(store.entities) == "table" then
+        for _, entity in pairs(store.entities) do
+            if type(entity) == "table" then
+                local friendly = entity.tower or entity.hero or entity.soldier
+                if invincible and friendly and entity.health and not entity.health.dead
+                    and type(entity.health.hp_max) == "number" then
+                    remember_and_set("god", entity.health, "hp", entity.health.hp_max)
+                end
+                if no_cooldown and entity.hero then
+                    recursive_scale_cooldowns("hero_cd", entity, 0, 5, {})
+                end
+                if tower_speed_enabled and entity.tower then
+                    recursive_scale_cooldowns("tower_speed", entity, speed_multiplier, 4, {})
+                end
+                if tower_range_enabled and entity.tower then
+                    set_range_fields(entity, range_multiplier)
+                end
+                if damage_enabled and friendly then
+                    set_damage_fields(entity, damage_multiplier)
+                end
             end
         end
     end
 
+    -- 恢复必须放在 entities 判断之外：主菜单 / 关卡加载途中 store.entities 为 nil，
+    -- 若跟着提前 return，此时关闭开关就恢复不了，改动会残留到下一关。
     if not invincible then restore_group("god") end
     if not no_cooldown then restore_group("hero_cd") end
     if not damage_enabled then restore_group("damage") end

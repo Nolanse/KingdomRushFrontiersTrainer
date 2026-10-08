@@ -1,7 +1,7 @@
 # Kingdom Rush Frontiers 专用修改器 / Trainer
 
 ![platform](https://img.shields.io/badge/platform-Windows%20x64-blue)
-![version](https://img.shields.io/badge/version-1.0.2-green)
+![version](https://img.shields.io/badge/version-1.3.1-green)
 ![license](https://img.shields.io/badge/license-MIT-yellow)
 ![network](https://img.shields.io/badge/network-none-brightgreen)
 
@@ -12,7 +12,10 @@
 
 - 适配对象：Kingdom Rush Frontiers **6.4.46** · Windows Steam · x64 · LÖVE + LuaJIT
 - 架构沿用：Kingdom Rush Trainer（[gitee.com/zljgithub/KingdomRushTrainer](https://gitee.com/zljgithub/KingdomRushTrainer)，MIT，Gboxkit）的方案思路
-- 验证状态：44 项桥接断言 + 23 项界面断言全部通过
+- 验证状态：55 项桥接断言 + 38 项界面断言全部通过
+
+> 📖 **使用者请看 [`使用说明.md`](使用说明.md)**（快速上手 / 功能速查 / 快捷键 / 常见问题）。
+> 本文件面向开发者：架构、打包、目录结构与兼容性分析。
 
 > ⚠️ **免责声明**
 > 本项目为个人学习与研究的非官方粉丝作品，与 Ironhide Game Studio 无任何关联。
@@ -431,9 +434,36 @@ pyinstaller --onefile --windowed --name KingdomRushFrontiersTrainer \
 - 已验证：Kingdom Rush Frontiers **6.4.46** · Windows Steam · x64 · LÖVE + LuaJIT
 - 版本检查会确认三件事：PE 是 x64、`version.lua` 里能读到版本号、**`main.lua` 里存在 `custom_script`**。  
   最后一项是整个方案的前提——若游戏后续版本移除了这个入口，修改器会明确报错而不是静默失效
-- 不支持 32 位、非 Steam 构建
+- 不支持 32 位；非 Steam 库安装见下方专节
 - 高倍速增加 CPU 占用，建议日常 2x–5x；8x 以上可能掉帧
 - 强制清场可能跳过 Boss / 脚本事件，优先用「提前呼叫下一波」
+
+### 非 Steam 库安装（第三方渠道 / 绿色版 / 手动拷贝）
+
+适用于「游戏本体与 Steam 版一致、但安装目录不在 `steamapps\common` 下」的情形。
+这类环境的三个差异与处理方式：
+
+| 差异 | 旧版表现 | v1.3.0 起的处理 |
+| --- | --- | --- |
+| 扫不到 `appmanifest_*.acf`，识别不出 AppID | 不注入 `SteamAppId` → `steam_api.dll` 初始化失败 → **游戏 1–2 秒静默退出**，界面显示「游戏进程已退出或未能识别」 | 目录里有 `steam_api.dll` / `steam_api64.dll` 时按已知 AppID **458710** 兜底注入（日志会写明实际注入值） |
+| 自动探测只扫 Steam 库，找不到 exe | 「版本检查：未找到游戏」，只能手动浏览 | Steam 库里确实没有副本时，额外扫描 `桌面 / 下载 / 文档` 两层目录 |
+| 版本串前缀与官方不一致 | 直接判定「不兼容或无法识别」 | 仍含 `kr2` 时退化匹配任意 `x.y.z`，标签上注明「版本串非标准」 |
+
+**仍然必需的前提**（缺一个就跑不起来，与本程序无关）：
+
+1. 游戏本体必须保留 `main.lua` 里的 `-custom_script` 入口 —— 版本检查会明确告诉你有没有；
+2. 进程必须真的能启动，即 `steam_api.dll` 需要的 Steam 运行上下文可用。  
+   只注入 `SteamAppId` 并不能替代 Steam 客户端本身：客户端没在跑时请先把 Steam（或你自己的等效启动方式）拉起来。
+
+**推荐做法**（不依赖本程序启动，兼容性最好）：
+让游戏以 `-custom_script krft_bridge` 参数启动（Steam 启动选项、快捷方式目标、批处理均可），
+修改器开着就会自动连上，顶部显示「桥接状态：v… · 关卡中」。
+
+**仍失败时的逃生口**（界面顶部两个复选框 + 存档目录「重新检测」）：
+
+- 「忽略兼容性检查」：版本检查不通过也照样准备桥接并尝试启动
+- 「注入 Steam 运行环境变量」：取消勾选则完全不注入 `SteamAppId`/`SteamGameId`
+- `launch.json` 的 `game_path` / `steam_app_id` / `extra_args` / `save_dir` 可逐项手工覆盖
 
 ---
 
@@ -467,6 +497,18 @@ KingdomRushFrontiersTrainer.exe
 - 关闭游戏，改用本程序的「启动 / 连接游戏」
 - 或在 Steam → 库 → 右键游戏 → 属性 → 通用 → 启动选项填：
   `-custom_script krft_bridge`
+</details>
+
+<details>
+<summary><b>游戏一启动就退出 / 「游戏进程已退出或未能识别」</b></summary>
+
+`steam_api.dll` 拿不到 Steam 运行上下文时会静默退出。按序排查：
+
+1. 看日志里「注入 Steam 环境（AppID …）」—— 若显示「未能识别 AppID」，
+   说明目录不在 Steam 库内且没有 `steam_api.dll`，请确认选中的 exe 是游戏本体；
+2. 确认 Steam 客户端正在运行（只注入 AppID 不能替代客户端）；
+3. 仍不行就取消勾选「注入 Steam 运行环境变量」，改为给游戏加
+   `-custom_script krft_bridge` 启动参数后由修改器自动连接。
 </details>
 
 <details>
