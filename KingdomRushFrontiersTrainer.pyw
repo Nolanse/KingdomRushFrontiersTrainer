@@ -32,7 +32,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Kingdom Rush Frontiers 专用修改器"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_BUILD_DATE = "2026-10-03"
 APP_CREDITS = f"v{APP_VERSION} · {APP_BUILD_DATE}"
 
@@ -664,15 +664,33 @@ def hotkey_vk(text: str) -> tuple[set[str], int]:
     return mods, 0
 
 
-class HotkeyPoller(threading.Thread):
-    """后台轮询全局快捷键。"""
+# 缓存 user32 句柄：HotkeyPoller 每秒要调用上千次 GetAsyncKeyState，
+# 每次新建 WinDLL 会重复解析 DLL 并覆盖 use_last_error 的 TLS 状态。
+_USER32 = None
 
-    def __init__(self, callback, mapping: dict[str, str]):
+
+def _user32():
+    global _USER32
+    if _USER32 is None:
+        _USER32 = ctypes.WinDLL("user32", use_last_error=True)
+    return _USER32
+
+
+class HotkeyPoller(threading.Thread):
+    """后台轮询全局快捷键。
+
+    注意：本线程只负责「检测」，不直接调用回调。
+    回调会操作 Tk 变量与弹出模态框，必须经 root.after 投递回主线程执行，
+    否则 Tk 会抛 "main thread is not in main loop"（实测可复现）。
+    """
+
+    def __init__(self, root: tk.Tk, callback, mapping: dict[str, str]):
         super().__init__(daemon=True)
+        self._root = root
         self.callback = callback
         self.mapping = mapping
         self._stop = threading.Event()
-        self._down: set[int] = set()
+        self._down: set[tuple] = set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -680,7 +698,22 @@ class HotkeyPoller(threading.Thread):
     def _pressed(self, vk: int) -> bool:
         if os.name != "nt":
             return False
-        return bool(ctypes.WinDLL("user32", use_last_error=True).GetAsyncKeyState(vk) & 0x8000)
+        return bool(_user32().GetAsyncKeyState(vk) & 0x8000)
+
+    def _invoke(self, action: str) -> None:
+        """在主线程执行回调（由 root.after 调用）。"""
+        try:
+            self.callback(action)
+        except Exception:
+            log_message("快捷键处理异常：\n" + traceback.format_exc())
+
+    def _dispatch(self, action: str) -> None:
+        """把回调投递到主线程。窗口已销毁时静默丢弃。"""
+        try:
+            self._root.after(0, lambda a=action: self._invoke(a))
+        except Exception:
+            # TclError：主循环已退出（窗口关闭），忽略即可
+            pass
 
     def run(self) -> None:
         while not self._stop.is_set():
@@ -695,10 +728,7 @@ class HotkeyPoller(threading.Thread):
                     if self._pressed(key_vk):
                         if token not in self._down:
                             self._down.add(token)
-                            try:
-                                self.callback(action)
-                            except Exception:
-                                log_message("快捷键处理异常：\n" + traceback.format_exc())
+                            self._dispatch(action)
                     else:
                         self._down.discard(token)
             time.sleep(0.05)
@@ -769,7 +799,7 @@ class TrainerApp:
         self.configure_style()
         self.build_ui()
 
-        self.poller = HotkeyPoller(self.on_hotkey, self.hotkeys)
+        self.poller = HotkeyPoller(root, self.on_hotkey, self.hotkeys)
         self.poller.start()
         atexit.register(self.shutdown)
 
@@ -1085,10 +1115,27 @@ class TrainerApp:
         lines.append(f"    heartbeat = {int(time.time())},")
         return "return {\n" + "\n".join(lines) + "\n}\n"
 
+    # 所有可写数值参数的合法区间。与 Lua 侧 clamp_number 的范围保持一致，
+    # 避免「GUI 越界值 / 手改状态文件」把非法值写进桥接。
+    CLAMP_RULES: dict[str, tuple[float, float]] = {
+        "speed": (1.0, 16.0),
+        "gold_value": (0.0, 999999999.0),
+        "gems_value": (0.0, 999999999.0),
+        "lives_value": (1.0, 9999.0),
+        "kill_gold_multiplier": (0.1, 1000.0),
+        "damage_multiplier": (0.1, 100.0),
+        "tower_speed_multiplier": (0.1, 50.0),
+        "tower_range_multiplier": (0.1, 20.0),
+        "barrack_soldiers": (1.0, 10.0),
+        "barrack_respawn_scale": (0.1, 5.0),
+    }
+
     def write_state(self, force: bool = False) -> None:
         try:
             self.collect_state()
-            self.state["speed"] = self.clamp_float(self.state.get("speed", 1.0), 1.0, 16.0, 1.0)
+            for key, (low, high) in self.CLAMP_RULES.items():
+                if key in self.state:
+                    self.state[key] = self.clamp_float(self.state[key], low, high, low)
             self.state["revision"] = int(self.state.get("revision", 0)) + 1
             self.state["heartbeat"] = int(time.time())
             atomic_write_text(self.save_dir / STATE_FILE, self.state_text())
@@ -1403,32 +1450,44 @@ class TrainerApp:
         self.root.after(500, lambda: self.verify_launch(process.pid))
 
     def verify_launch(self, pid: int) -> None:
-        deadline = time.time() + 20.0
-        while time.time() < deadline:
-            if not find_process_ids(TARGET_EXE_NAME):
-                self.connection_var.set("未连接")
-                self.bridge_var.set("桥接状态：游戏已退出")
-                messagebox.showwarning(
-                    APP_NAME,
-                    "游戏进程已退出。\n\n常见原因：\n"
-                    "1. 未检测到 Steam AppID（游戏需 Steam 运行环境）\n"
-                    "2. 游戏已在另一个 Steam 客户端实例中运行\n"
-                    "3. 启动参数不被当前版本接受")
-                return
-            status = self.read_bridge_status()
-            if status.get("bridge") == "1" and self.status_fresh(status):
-                self.connection_var.set(f"已连接（PID {pid}）")
-                self.bridge_var.set(f"桥接状态：已连接 v{status.get('bridge_version', '?')}")
-                self.log("桥接握手成功。")
-                return
-            time.sleep(0.4)
-        self.connection_var.set("未连接")
-        self.bridge_var.set("桥接状态：握手超时")
-        messagebox.showwarning(
-            APP_NAME,
-            "等待桥接握手超时。\n\n请确认：\n"
-            "1. 游戏窗口已正常打开\n"
-            "2. 存档目录可写（%APPDATA%\\" + SAVE_DIR_NAME + "）")
+        """等待桥接握手。
+
+        用 root.after 分帧轮询，而不是 while + time.sleep 阻塞主线程——
+        后者在桥接无响应时会冻结界面 20 秒（实测 21.5s），期间无法关闭窗口。
+        """
+        self._verify_deadline = time.time() + 20.0
+        self._verify_pid = pid
+        self._verify_tick()
+
+    def _verify_tick(self) -> None:
+        pid = getattr(self, "_verify_pid", 0)
+        if time.time() > getattr(self, "_verify_deadline", 0.0):
+            self.connection_var.set("未连接")
+            self.bridge_var.set("桥接状态：握手超时")
+            messagebox.showwarning(
+                APP_NAME,
+                "等待桥接握手超时。\n\n请确认：\n"
+                "1. 游戏窗口已正常打开\n"
+                "2. 存档目录可写（%APPDATA%\\" + SAVE_DIR_NAME + "）")
+            return
+        if not find_process_ids(TARGET_EXE_NAME):
+            self.connection_var.set("未连接")
+            self.bridge_var.set("桥接状态：游戏已退出")
+            messagebox.showwarning(
+                APP_NAME,
+                "游戏进程已退出。\n\n常见原因：\n"
+                "1. 未检测到 Steam AppID（游戏需 Steam 运行环境）\n"
+                "2. 游戏已在另一个 Steam 客户端实例中运行\n"
+                "3. 启动参数不被当前版本接受")
+            return
+        status = self.read_bridge_status()
+        if status.get("bridge") == "1" and self.status_fresh(status):
+            self.connection_var.set(f"已连接（PID {pid}）")
+            self.bridge_var.set(f"桥接状态：已连接 v{status.get('bridge_version', '?')}")
+            self.log("桥接握手成功。")
+            return
+        # 让出主线程，保持界面可响应
+        self.root.after(400, self._verify_tick)
 
     def read_bridge_status(self) -> dict[str, str]:
         return parse_status(self.save_dir / STATUS_FILE)

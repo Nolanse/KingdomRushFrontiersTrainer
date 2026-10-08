@@ -5,7 +5,7 @@
 -- 架构与 KR1 版一致：外部 GUI 写状态文件，本脚本在游戏自己的 LuaJIT 里读状态并改运行时数值。
 -- 不注入 DLL、不读写进程内存、不修改游戏安装目录。
 
-local BRIDGE_VERSION = "1.1.0"
+local BRIDGE_VERSION = "1.1.1"
 local STATE_FILE = "krft_state.lua"
 local STATUS_FILE = "krft_status.txt"
 local HEARTBEAT_TIMEOUT = 6
@@ -260,7 +260,12 @@ end
 local function refresh_config()
     local incoming = read_state()
     if type(incoming) ~= "table" then
-        config.active = false
+        -- 状态文件读失败（GUI 恰好在 os.replace 的瞬间被读到半截文件等），
+        -- 不要立刻停用：保留上一帧配置继续生效，等下一次轮询（0.2s 后）重试。
+        -- 只有心跳真正超时才恢复原值。
+        if os.time() - (tonumber(config.heartbeat) or 0) > HEARTBEAT_TIMEOUT then
+            config.active = false
+        end
         return
     end
     for key, value in pairs(incoming) do
@@ -522,7 +527,8 @@ local function apply_barracks(store)
         restore_group("barrack_respawn")
         return
     end
-    local count = math.floor(clamp_number(config.barrack_soldiers, 0, 10, 3))
+    -- 下限与 GUI 的 Spinbox(from_=1) 保持一致；设为 0 会让兵营完全不出兵
+    local count = math.floor(clamp_number(config.barrack_soldiers, 1, 10, 3))
     local scale = clamp_number(config.barrack_respawn_scale, 0.1, 5.0, 1.0)
     for _, entity in pairs(store.entities) do
         if type(entity) == "table" and type(entity.barrack) == "table" and entity.tower then

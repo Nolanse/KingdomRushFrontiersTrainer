@@ -298,6 +298,33 @@ dl = q("_store.entities[3].barrack.soldiers[1].health.dead_lifetime")
 check("兵营人数 3 -> 5", abs(ms - 5) < 1e-9, f"= {ms}")
 check("刷新时间 8 -> 4", abs(dl - 4.0) < 1e-6, f"= {dl}")
 
+# 边界：人数下限为 1（与 GUI Spinbox from_=1 对齐），0 会导致兵营完全不出兵
+write_state(active="true", speed_enabled="true", speed="1",
+            barrack_enabled="true", barrack_soldiers="0", barrack_respawn_scale="1.0")
+tick(2)
+check("兵营人数 0 被抬到下限 1",
+      abs(q("_store.entities[3].barrack.max_soldiers") - 1.0) < 1e-9,
+      f"= {q('_store.entities[3].barrack.max_soldiers')}")
+write_state(active="true", speed_enabled="true", speed="1",
+            barrack_enabled="true", barrack_soldiers="999", barrack_respawn_scale="1.0")
+tick(2)
+check("兵营人数 999 被压到上限 10",
+      abs(q("_store.entities[3].barrack.max_soldiers") - 10.0) < 1e-9,
+      f"= {q('_store.entities[3].barrack.max_soldiers')}")
+
+# 边界：状态文件损坏时不应立即停用（应等心跳超时才恢复）
+write_state(active="true", speed_enabled="true", speed="1",
+            gold_enabled="true", gold_value="12345")
+tick(2)
+check("锁定金币 12345 生效", abs(q("_store.player_gold") - 12345.0) < 1e-9)
+(work / "krft_state.lua").write_text("{ 损坏的 json", encoding="utf-8")
+tick(2)
+check("状态文件损坏后仍保持配置（未立即停用）",
+      abs(q("_store.player_gold") - 12345.0) < 1e-9,
+      f"= {q('_store.player_gold')}")
+write_state(active="true", speed_enabled="true", speed="1")
+tick(2)
+
 # 11) 杀敌金币倍率 5x（got-enemy-gold 信号）
 write_state(active="true", speed_enabled="true", speed="1", kill_gold_enabled="true", kill_gold_multiplier="5")
 dostring("_store.player_gold = 0")
