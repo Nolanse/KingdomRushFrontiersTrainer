@@ -218,6 +218,7 @@ python -m pip install -r requirements.txt
 ```bash
 python _test_bridge.py       # 桥接逻辑，44 项断言
 python _test_gui_smoke.py    # 界面冒烟，23 项断言
+python _test_launch.py       # 启动方式，39 项断言
 ```
 
 ---
@@ -269,6 +270,67 @@ set SteamAppId=458710
 
 ---
 
+### 两种启动方式
+
+界面顶部有「启动方式」单选，两个入口随时可切换：
+
+| | 方式一：本地配置 | 方式二：自动探测 |
+|---|---|---|
+| **入口** | 界面选「本地配置（方式一）」→ 点「启动 / 连接游戏」 | 界面选「自动探测（方式二）」→ 点「启动 / 连接游戏」 |
+| **数据来源** | `%LOCALAPPDATA%\KingdomRushFrontiersTrainer\launch.json` | 界面的「游戏路径」输入框 + Steam 库扫描 |
+| **游戏路径** | 取配置里的 `game_path` | 手动填写，或点「浏览」，或自动扫描 Steam 库 |
+| **Steam AppID** | 取配置里的 `steam_app_id`；填 `0`/留空则自动识别 | 始终自动识别（458710） |
+| **附加参数** | 取配置里的 `extra_args`，追加在 `-custom_script` 之后 | 无 |
+| **适合场景** | 游戏装在 Steam 库扫描不到的非常规位置；需要固定 AppID 或额外启动参数；多机复用同一配置 | 绝大多数用户 |
+
+#### 配置文件格式
+
+点界面上的「导出配置模板」会在上述路径生成 `launch.json`：
+
+```json
+{
+  "mode": "config",
+  "game_path": "E:////SteamLibrary////steamapps////common////Kingdom Rush Frontiers////Kingdom Rush Frontiers.exe",
+  "steam_app_id": "458710",
+  "extra_args": [],
+  "use_steam_env": true
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `mode` | string | `config` 用方式一；`auto` 用方式二（忽略本文件其余内容） |
+| `game_path` | string | 游戏 exe 路径。**留空则回退到自动探测路径**，但仍按方式一处理附加参数 |
+| `steam_app_id` | int | 留空或 `0` 时自动识别；非整数会导致整个配置被忽略并回退 |
+| `extra_args` | string[] | 追加的自定义参数；写成单个字符串会自动包成数组 |
+| `use_steam_env` | bool | 设为 `false` 则不注入 `SteamAppId`/`SteamGameId` |
+
+#### 优先级与回退
+
+**优先级**：界面上的选择是唯一决定因素。
+
+- 选中「方式二」→ **一律走自动探测，即使 `launch.json` 存在也不读**
+- 选中「方式一」→ 读配置，下列任一情况**自动回退到方式二**并把原因写进日志：
+
+| 异常情况 | 回退原因日志 |
+|---|---|
+| `launch.json` 不存在 | `配置不可用：配置文件不存在` |
+| JSON 语法错误 | `配置不可用：配置文件不是合法 JSON：…` |
+| 顶层不是对象 | `配置不可用：配置文件顶层必须是 JSON 对象` |
+| `mode` 取值非法 | `配置不可用：mode 只能是 auto 或 config，收到：…` |
+| `steam_app_id` 非整数 | `配置不可用：steam_app_id 必须是整数，收到：…` |
+| `extra_args` 不是字符串数组 | `配置不可用：extra_args 必须是字符串数组` |
+| `game_path` 指向的文件不存在 | `启动方式一不可用（配置中的 game_path 不存在：…）` |
+
+此外还有**运行期二次回退**：若方式一的路径能通过存在性检查、但 `CreateProcess` 仍失败
+（例如文件被占用、权限不足），程序会记录原因并用自动探测路径再试一次；
+两次都失败才弹错误框。
+
+设计原则：**任何配置问题都不该让用户启动不了游戏。**
+
+界面下方那行说明会实时反映当前状态：配置就绪时显示目标路径与附加参数，
+配置有问题时直接告诉你会回退。
+
 ## 使用 / Usage（详细）
 
 ### 方式 A：由修改器启动（推荐首次使用）
@@ -316,6 +378,7 @@ set SteamAppId=458710
 | `krft_bridge.lua`                 | 在游戏 LuaJIT 环境中运行的桥接脚本                   |
 | `_test_bridge.py`                 | 桥接仿真测试（44 项断言，用游戏自带 `lua51.dll` 加载真实桥接） |
 | `_test_gui_smoke.py`              | 界面冒烟测试（23 项断言，真实构建 Tk 控件并驱动回调）          |
+| `_test_launch.py`                 | 启动方式测试（39 项断言，覆盖两种方式的优先级与全部回退路径）    |
 
 ### 跑测试
 

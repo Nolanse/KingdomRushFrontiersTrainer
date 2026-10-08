@@ -32,7 +32,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Kingdom Rush Frontiers 专用修改器"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.1.0"
 APP_BUILD_DATE = "2026-10-03"
 APP_CREDITS = f"v{APP_VERSION} · {APP_BUILD_DATE}"
 
@@ -505,6 +505,110 @@ def parse_status(path: Path) -> dict[str, str]:
     return result
 
 
+# =====================================================================
+# 启动方式一：本地配置文件
+# =====================================================================
+# 允许用户在 %LOCALAPPDATA%\KingdomRushFrontiersTrainer\launch.json 里
+# 预先写好游戏路径、Steam AppID 与附加启动参数。适合：
+#   - 游戏装在 Steam 库扫描不到的非常规位置
+#   - 需要固定 AppID 或额外启动参数
+#   - 想在多台机器上复用同一份配置
+LAUNCH_CONFIG_NAME = "launch.json"
+# 允许的启动方式取值
+LAUNCH_MODE_AUTO = "auto"        # 方式二：自动探测（默认）
+LAUNCH_MODE_CONFIG = "config"    # 方式一：读本地配置文件
+LAUNCH_MODE_CHOICES = (LAUNCH_MODE_AUTO, LAUNCH_MODE_CONFIG)
+
+
+def launch_config_path() -> Path:
+    return app_config_dir() / LAUNCH_CONFIG_NAME
+
+
+def sample_launch_config() -> dict[str, object]:
+    """生成一份配置模板，供「导出配置模板」使用。"""
+    return {
+        "mode": LAUNCH_MODE_CONFIG,
+        "game_path": "",
+        "steam_app_id": "",
+        "extra_args": [],
+        "use_steam_env": True,
+        "note": "game_path 留空则回退到自动探测；填 Steam 库外的非常规路径时必填",
+    }
+
+
+def load_launch_config() -> tuple[dict[str, object] | None, str]:
+    """读取本地启动配置。
+
+    返回 (配置, 错误说明)。任一环节出问题都返回 (None, 原因)，
+    调用方据此回退到自动探测，绝不因为配置问题让用户启动不了游戏。
+    """
+    path = launch_config_path()
+    if not path.is_file():
+        return None, "配置文件不存在"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"配置文件无法读取：{exc}"
+    if not raw.strip():
+        return None, "配置文件为空"
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        return None, f"配置文件不是合法 JSON：{exc}"
+    if not isinstance(data, dict):
+        return None, "配置文件顶层必须是 JSON 对象"
+
+    mode = str(data.get("mode", LAUNCH_MODE_CONFIG)).strip().lower()
+    if mode not in LAUNCH_MODE_CHOICES:
+        return None, f"mode 只能是 {' 或 '.join(LAUNCH_MODE_CHOICES)}，收到：{mode}"
+
+    extra = data.get("extra_args", [])
+    if isinstance(extra, str):
+        extra = [extra]
+    if not isinstance(extra, list) or not all(isinstance(x, str) for x in extra):
+        return None, "extra_args 必须是字符串数组"
+
+    app_id_raw = data.get("steam_app_id", "")
+    app_id = 0
+    if str(app_id_raw).strip():
+        try:
+            app_id = int(str(app_id_raw).strip())
+        except ValueError:
+            return None, f"steam_app_id 必须是整数，收到：{app_id_raw!r}"
+
+    game_raw = str(data.get("game_path", "")).strip().strip('"')
+    game = Path(game_raw).expanduser() if game_raw else None
+
+    return {
+        "mode": mode,
+        "game": game,
+        "steam_app_id": app_id,
+        "extra_args": list(extra),
+        "use_steam_env": bool(data.get("use_steam_env", True)),
+    }, ""
+
+
+def build_launch_env(game_path: Path, app_id: int = 0, use_steam: bool = True) -> dict[str, str]:
+    """构造子进程环境变量。
+
+    app_id 显式给出时优先使用；否则按 Steam 库自动识别。
+    use_steam=False 时不注入任何 Steam 变量（用于自定义启动场景）。
+    """
+    env = os.environ.copy()
+    if use_steam:
+        resolved = app_id if app_id > 0 else detect_steam_app_id(game_path)
+        if resolved:
+            env["SteamAppId"] = str(resolved)
+            env["SteamGameId"] = str(resolved)
+    try:
+        game_dir = str(game_path.resolve().parent)
+        if game_dir not in env.get("PATH", ""):
+            env["PATH"] = game_dir + os.pathsep + env.get("PATH", "")
+    except OSError:
+        pass
+    return env
+
+
 def safe_int(value, fallback: int = 0) -> int:
     try:
         return int(float(value))
@@ -717,6 +821,27 @@ class TrainerApp:
         self.launch_button = ttk.Button(top, text="启动 / 连接游戏", command=self.launch_game)
         self.launch_button.pack(side="left", padx=(6, 0))
 
+        # 启动方式：与「游戏路径」并列，两个入口各自独立可用
+        mode_row = ttk.Frame(outer)
+        mode_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(mode_row, text="启动方式").pack(side="left")
+        self.launch_mode_var = tk.StringVar(value=self.detect_launch_mode())
+        auto_radio = ttk.Radiobutton(
+            mode_row, text="自动探测（方式二）", variable=self.launch_mode_var,
+            value=LAUNCH_MODE_AUTO, command=self.on_launch_mode_changed)
+        auto_radio.pack(side="left", padx=(10, 0))
+        config_radio = ttk.Radiobutton(
+            mode_row, text="本地配置（方式一）", variable=self.launch_mode_var,
+            value=LAUNCH_MODE_CONFIG, command=self.on_launch_mode_changed)
+        config_radio.pack(side="left", padx=(10, 0))
+        ttk.Button(mode_row, text="打开配置目录", style="Hotkey.TButton",
+                   command=self.open_launch_config).pack(side="left", padx=(10, 0))
+        ttk.Button(mode_row, text="导出配置模板", style="Hotkey.TButton",
+                   command=self.export_launch_template).pack(side="left", padx=(4, 0))
+        self.mode_hint = ttk.Label(outer, text="", style="Muted.TLabel")
+        self.mode_hint.pack(anchor="w", pady=(2, 0))
+        self.refresh_mode_hint()
+
         self.version_label = ttk.Label(outer, text="版本检查：检查中…")
         self.version_label.pack(anchor="w", pady=(4, 0))
         conn = ttk.Frame(outer)
@@ -897,7 +1022,7 @@ class TrainerApp:
         try:
             data = json.loads(self.config_file().read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return
+            data = {}
         if isinstance(data.get("state"), dict):
             for key, value in data["state"].items():
                 if key in self.state:
@@ -906,13 +1031,19 @@ class TrainerApp:
             for key, value in data["hotkeys"].items():
                 if key in DEFAULT_HOTKEYS and isinstance(value, str):
                     self.hotkeys[key] = normalize_hotkey(value) or DEFAULT_HOTKEYS[key]
+        # 恢复启动方式；缺省时依据 launch.json 是否存在自动判断
+        self._saved_launch_mode = data.get("launch_mode")
+        if self._saved_launch_mode not in LAUNCH_MODE_CHOICES:
+            self._saved_launch_mode = None
 
     def save_config(self) -> None:
         try:
             path = self.config_file()
             path.parent.mkdir(parents=True, exist_ok=True)
+            mode = self.launch_mode_var.get() if hasattr(self, "launch_mode_var") else LAUNCH_MODE_AUTO
             atomic_write_text(path, json.dumps(
-                {"state": self.state, "hotkeys": self.hotkeys}, ensure_ascii=False, indent=2))
+                {"state": self.state, "hotkeys": self.hotkeys, "launch_mode": mode},
+                ensure_ascii=False, indent=2))
         except OSError:
             pass
 
@@ -1062,14 +1193,162 @@ class TrainerApp:
             self.version_label.configure(text=note, style="Bad.TLabel")
         return result
 
+    def detect_launch_mode(self) -> str:
+        """默认选中的启动方式：优先用户上次的选择，其次看 launch.json 是否存在。"""
+        saved = getattr(self, "_saved_launch_mode", None)
+        if saved in LAUNCH_MODE_CHOICES:
+            return str(saved)
+        config, _ = load_launch_config()
+        if config and config.get("mode") in LAUNCH_MODE_CHOICES:
+            return str(config["mode"])
+        return LAUNCH_MODE_AUTO
+
+    def refresh_mode_hint(self) -> None:
+        """刷新启动方式说明标签。"""
+        path = launch_config_path()
+        mode = self.launch_mode_var.get()
+        if mode == LAUNCH_MODE_CONFIG:
+            if path.is_file():
+                config, err = load_launch_config()
+                if config:
+                    game = config["game"]
+                    where = str(game) if game else "（未指定，将回退自动探测）"
+                    self.mode_hint.configure(
+                        text=f"方式一：将读取 {path.name} —— 目标 {where}；"
+                             f"附加参数 {config['extra_args'] or '无'}",
+                        style="Good.TLabel")
+                else:
+                    self.mode_hint.configure(
+                        text=f"方式一：配置无效（{err}），启动时将自动回退到方式二", style="Bad.TLabel")
+            else:
+                self.mode_hint.configure(
+                    text=f"方式一：未找到 {path.name}，可点「导出配置模板」生成；启动时将自动回退到方式二",
+                    style="Bad.TLabel")
+        else:
+            self.mode_hint.configure(
+                text="方式二：使用上方「游戏路径」，并自动识别 Steam AppID（458710）注入环境变量",
+                style="Muted.TLabel")
+
+    @guarded
+    def on_launch_mode_changed(self) -> None:
+        self.refresh_mode_hint()
+        self.save_config()
+
+    @guarded
+    def open_launch_config(self) -> None:
+        """打开配置所在目录；文件不存在时先导出模板。"""
+        path = launch_config_path()
+        if not path.is_file():
+            self.export_launch_template()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(path.parent))  # noqa: S606  (Windows 打开资源管理器)
+        except (OSError, AttributeError) as exc:
+            messagebox.showinfo(APP_NAME, f"配置目录：\n{path.parent}\n\n（无法自动打开：{exc}）")
+
+    @guarded
+    def export_launch_template(self) -> None:
+        """导出 launch.json 模板，已存在时不覆盖。"""
+        path = launch_config_path()
+        if path.is_file():
+            if not messagebox.askyesno(APP_NAME, f"{path.name} 已存在，是否覆盖？"):
+                return
+        template = sample_launch_config()
+        detected = locate_default_game()
+        if detected is not None and detected.name == TARGET_EXE_NAME:
+            template["game_path"] = str(detected)
+            template["steam_app_id"] = str(detect_steam_app_id(detected) or "")
+        try:
+            atomic_write_text(path, json.dumps(template, ensure_ascii=False, indent=2))
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"导出配置模板失败：\n{exc}")
+            return
+        self.log(f"已导出配置模板：{path}")
+        self.refresh_mode_hint()
+        messagebox.showinfo(
+            APP_NAME,
+            f"已导出配置模板：\n{path}\n\n"
+            "可直接编辑 game_path / steam_app_id / extra_args。\n"
+            "mode 填 config 时生效，填 auto 则忽略本文件。")
+
+    def resolve_launch_plan(self) -> dict[str, object]:
+        """决定本次启动走哪条路径。
+
+        优先级：
+          1. 界面选中「方式一」且 launch.json 配置可用  -> 读本地文件启动
+          2. 其余情况                                   -> 自动探测（方式二）
+
+        回退：方式一因「文件不存在 / JSON 非法 / 路径无效 / mode 不符」不可用时，
+        一律记录原因并回退方式二，绝不让配置问题挡住启动。
+        """
+        wanted = self.launch_mode_var.get() if hasattr(self, "launch_mode_var") else LAUNCH_MODE_AUTO
+
+        config, err = load_launch_config()
+        if wanted == LAUNCH_MODE_CONFIG:
+            if not config:
+                reason = f"配置不可用：{err or '未知原因'}"
+                self.log(f"启动方式一不可用（{reason}），回退到自动探测。")
+                return self._auto_launch_plan(reason)
+            game: Path | None = config["game"]
+            if game is not None and not game.is_file():
+                reason = f"配置中的 game_path 不存在：{game}"
+                self.log(f"启动方式一不可用（{reason}），回退到自动探测。")
+                return self._auto_launch_plan(reason)
+            # game_path 留空是允许的：此时直接用自动探测路径，但保持方式一的参数
+            target = game if (game is not None and game.is_file()) else Path(
+                self.game_path_var.get().strip() or str(locate_default_game()))
+            if not target.is_file():
+                reason = f"无法定位可执行文件：{target}"
+                self.log(f"启动方式一不可用（{reason}），回退到自动探测。")
+                return self._auto_launch_plan(reason)
+            return {
+                "mode": LAUNCH_MODE_CONFIG,
+                "game": target,
+                "app_id": int(config["steam_app_id"]) or detect_steam_app_id(target),
+                "extra_args": list(config["extra_args"]),
+                "use_steam": bool(config["use_steam_env"]),
+                "fallback_reason": "" if game is not None else "配置未指定 game_path，已定位自动探测路径",
+            }
+
+        # 界面明确选了方式二：即使存在配置也不读
+        return self._auto_launch_plan("")
+
+    def _auto_launch_plan(self, fallback_reason: str) -> dict[str, object]:
+        """方式二：沿用界面上的游戏路径 + Steam 自动识别。"""
+        path_text = self.game_path_var.get().strip()
+        game = Path(path_text).expanduser() if path_text else locate_default_game()
+        return {
+            "mode": LAUNCH_MODE_AUTO,
+            "game": game,
+            "app_id": 0,  # 由 build_launch_env 自动识别
+            "extra_args": [],
+            "use_steam": True,
+            "fallback_reason": fallback_reason,
+        }
+
     @guarded
     def launch_game(self) -> None:
-        result = self.check_version()
-        if not result["valid"]:
-            if not messagebox.askyesno(
-                    APP_NAME,
-                    f"当前游戏文件未通过兼容性检查：\n{result['reason']}\n\n仍要准备桥接文件并尝试启动吗？"):
-                return
+        plan = self.resolve_launch_plan()
+        game_path: Path = plan["game"]
+        mode = plan["mode"]
+
+        if mode == LAUNCH_MODE_AUTO:
+            self.game_path = game_path
+            self.game_path_var.set(str(game_path))
+            result = self.check_version()
+            if not result["valid"]:
+                if not messagebox.askyesno(
+                        APP_NAME,
+                        f"当前游戏文件未通过兼容性检查：\n{result['reason']}\n\n仍要准备桥接文件并尝试启动吗？"):
+                    return
+        else:
+            self.game_path = game_path
+            self.game_path_var.set(str(game_path))
+            self.log(f"启动方式一：使用本地配置的游戏路径 {game_path}")
+            result = self.check_version()
+            if not result["valid"]:
+                self.log(f"配置路径未通过兼容性检查（{result['reason']}），继续尝试启动。")
+
         if not self.prepare_bridge():
             return
         self.save_config()
@@ -1085,16 +1364,40 @@ class TrainerApp:
             messagebox.showwarning(APP_NAME, "游戏已在运行，但桥接未就绪。\n\n请完全退出游戏后重试。")
             return
 
-        env = steam_launch_env(self.game_path)
-        args = [str(self.game_path), "-custom_script", BRIDGE_MODULE]
-        self.log(f"启动游戏：{' '.join(args)}")
+        args = [str(game_path), "-custom_script", BRIDGE_MODULE]
+        args.extend(plan["extra_args"])
+        env = build_launch_env(game_path, int(plan["app_id"]), bool(plan["use_steam"]))
+        label = "方式一（本地配置）" if mode == LAUNCH_MODE_CONFIG else "方式二（自动探测）"
+        if plan["fallback_reason"]:
+            self.log(f"本次以{label}启动；回退原因：{plan['fallback_reason']}")
+        else:
+            self.log(f"本次以{label}启动：{' '.join(args)}")
         try:
             process = subprocess.Popen(
-                args, env=env, cwd=str(self.game_path.parent),
+                args, env=env, cwd=str(game_path.parent),
                 creationflags=CREATE_NEW_PROCESS_GROUP)
         except OSError as exc:
-            messagebox.showerror(APP_NAME, f"启动失败：\n{exc}")
-            return
+            # 方式一失败时，若与方式二路径不同，尝试用自动探测再试一次
+            if mode == LAUNCH_MODE_CONFIG and not plan["fallback_reason"]:
+                auto_game = locate_default_game()
+                if auto_game and auto_game.resolve() != game_path.resolve():
+                    self.log(f"配置路径启动失败（{exc}），改用自动探测路径重试：{auto_game}")
+                    try:
+                        process = subprocess.Popen(
+                            [str(auto_game), "-custom_script", BRIDGE_MODULE],
+                            env=build_launch_env(auto_game), cwd=str(auto_game.parent),
+                            creationflags=CREATE_NEW_PROCESS_GROUP)
+                        self.game_path = auto_game
+                        self.game_path_var.set(str(auto_game))
+                    except OSError as exc2:
+                        messagebox.showerror(APP_NAME, f"两种启动方式均失败：\n{exc}\n\n自动探测重试：{exc2}")
+                        return
+                else:
+                    messagebox.showerror(APP_NAME, f"启动失败：\n{exc}")
+                    return
+            else:
+                messagebox.showerror(APP_NAME, f"启动失败：\n{exc}")
+                return
         self.pid = process.pid
         self.log(f"游戏进程已创建 PID {self.pid}，等待桥接握手…")
         self.root.after(500, lambda: self.verify_launch(process.pid))

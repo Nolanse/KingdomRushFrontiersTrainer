@@ -5,7 +5,7 @@
 -- 架构与 KR1 版一致：外部 GUI 写状态文件，本脚本在游戏自己的 LuaJIT 里读状态并改运行时数值。
 -- 不注入 DLL、不读写进程内存、不修改游戏安装目录。
 
-local BRIDGE_VERSION = "1.0.2"
+local BRIDGE_VERSION = "1.1.0"
 local STATE_FILE = "krft_state.lua"
 local STATUS_FILE = "krft_status.txt"
 local HEARTBEAT_TIMEOUT = 6
