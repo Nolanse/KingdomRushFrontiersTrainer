@@ -99,7 +99,11 @@ package.preload["storage"] = function()
     [1] = { gems = 100, levels = { [1] = { stars = 1 } } }
   } }
   function M:load_slot(i) return self.slots[i] end
-  function M:save_slot(slot, i, _) self.slots[i] = slot; return true end
+  function M:save_slot(slot, i, _)
+    self.slots[i] = slot
+    self.save_slot_calls = (self.save_slot_calls or 0) + 1
+    return true
+  end
   storage = M   -- 真实游戏里 storage 是全局
   return M
 end
@@ -122,7 +126,7 @@ DEFAULTS = {
     "tower_speed_enabled": "false", "tower_speed_multiplier": "3",
     "tower_range_enabled": "false", "tower_range_multiplier": "2",
     "barrack_enabled": "false", "barrack_soldiers": "3", "barrack_respawn_scale": "1.0",
-    "unlock_levels": "false", "three_stars": "false",
+    "unlock_levels": "false", "three_stars": "false", "read_only": "false",
     "cmd_skip_wave": "0", "cmd_force_wave": "0", "cmd_win": "0",
 }
 
@@ -432,6 +436,40 @@ write_state(active="true", speed_enabled="true", speed="4")
 tick(2)
 check("有效心跳速度保持 4x", qs("game.DBG_TIME_MULT") == "4", f"= {qs('game.DBG_TIME_MULT')}")
 
+# 只读模式：即使状态文件强行打开三项存档功能，桥接也必须不执行
+setup_game()
+# 记录进入只读前的计数，只断言「只读期间不增长」
+dostring("storage.save_slot_calls = 0")
+write_state(active="true", speed_enabled="true", speed="1", read_only="true",
+            gems_enabled="true", gems_value="77777",
+            unlock_levels="true", three_stars="true")
+tick(3)
+check("只读：宝石未被动", qs("storage.slots[1].gems") == "100",
+      f"= {qs('storage.slots[1].gems')}")
+check("只读：第 22 关未写入三星", qs("storage.slots[1].levels[22]") == "nil",
+      f"= {qs('storage.slots[1].levels[22]')}")
+check("只读：save_slot 未被调用",
+      qs("(storage.save_slot_calls or 0)") == "0",
+      f"= {qs('(storage.save_slot_calls or 0)')}")
+
+# 只读模式下运行时功能仍应可用
+write_state(active="true", speed_enabled="true", speed="5", read_only="true",
+            damage_enabled="true", damage_multiplier="3")
+tick(2)
+check("只读：速度 5x 仍生效", qs("game.DBG_TIME_MULT") == "5", f"= {qs('game.DBG_TIME_MULT')}")
+check("只读：伤害 3x 仍生效",
+      abs(q("_store.entities[1].attacks.list[1].damage_min") - 30.0) < 1e-6,
+      f"= {q('_store.entities[1].attacks.list[1].damage_min')}")
+check("只读：状态回报 slot_writable=0",
+      "slot_writable=0" in (work / "krft_status.txt").read_text(encoding="utf-8"))
+
+# 关闭只读后应恢复正常
+write_state(active="true", speed_enabled="true", speed="1", read_only="false",
+            gems_enabled="true", gems_value="88888")
+tick(3)
+check("关闭只读后宝石功能恢复", qs("storage.slots[1].gems") == "88888",
+      f"= {qs('storage.slots[1].gems')}")
+
 print("\n" + "="*50)
 if FAILURES:
     print(f"FAILED {len(FAILURES)}: {FAILURES}")
@@ -439,3 +477,4 @@ else:
     print("ALL TESTS PASSED")
 shutil.rmtree(work, ignore_errors=True)
 sys.exit(1 if FAILURES else 0)
+

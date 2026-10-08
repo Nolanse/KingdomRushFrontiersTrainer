@@ -35,7 +35,7 @@ check("桥接脚本可定位", m.resource_path(m.BRIDGE_FILE).is_file())
 check("默认只开速度", app.state["speed_enabled"] is True and app.state["gold_enabled"] is False)
 EXPECTED_TOGGLES = {"speed_enabled","gold_enabled","gems_enabled","lives_enabled","kill_gold_enabled",
     "invincible","hero_no_cooldown","damage_enabled","tower_speed_enabled","tower_range_enabled",
-    "barrack_enabled","unlock_levels","three_stars"}
+    "barrack_enabled","unlock_levels","three_stars","read_only"}
 check("toggle 键齐全", set(app.toggles) == EXPECTED_TOGGLES,
       f"= {len(app.toggles)} 个, 缺 {EXPECTED_TOGGLES - set(app.toggles)}")
 check("数值控件数量>=10", len(app.values) >= 10, f"= {len(app.values)}")
@@ -108,6 +108,31 @@ check("无存档时宝石开关被回滚（安全）", app.state["gems_enabled"]
 check("回滚后不崩溃且日志有记录", "存档" in app.status_text.get("1.0", "end"))
 
 # 退出恢复
+# 只读模式：应禁用三个存档开关并保留原值
+app.backup_done = True
+app.toggles["gems_enabled"].set(True)
+app.toggles["unlock_levels"].set(True)
+app.toggles["three_stars"].set(True)
+app.on_toggle()
+app.toggles["read_only"].set(True)
+app.on_toggle()
+check("只读：三项存档开关被禁用",
+      all(str(app._slot_widgets[k]["state"]) == "disabled" for k in app.SLOT_FEATURES),
+      f"= {[str(app._slot_widgets[k]['state']) for k in app.SLOT_FEATURES]}")
+check("只读：开关值被强制清零", not any(app.state[k] for k in app.SLOT_FEATURES))
+check("只读：状态文件写 read_only=true",
+      "read_only = true" in (app.save_dir / m.STATE_FILE).read_text(encoding="utf-8"))
+check("只读：存档三项落盘为 false",
+      all(f"{k} = false" in (app.save_dir / m.STATE_FILE).read_text(encoding="utf-8")
+          for k in app.SLOT_FEATURES))
+# 关闭只读应恢复可用与原值
+app.toggles["read_only"].set(False)
+app.on_toggle()
+check("关闭只读：开关恢复可用",
+      all(str(app._slot_widgets[k]["state"]) != "disabled" for k in app.SLOT_FEATURES))
+check("关闭只读：原值被恢复（gems 仍开）", app.state["gems_enabled"] is True,
+      f"= {app.state['gems_enabled']}")
+
 app.shutdown()
 txt2 = (app.save_dir / m.STATE_FILE).read_text(encoding="utf-8")
 check("退出时 active=false", "active = false" in txt2)

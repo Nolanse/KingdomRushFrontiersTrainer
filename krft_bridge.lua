@@ -5,7 +5,7 @@
 -- 架构与 KR1 版一致：外部 GUI 写状态文件，本脚本在游戏自己的 LuaJIT 里读状态并改运行时数值。
 -- 不注入 DLL、不读写进程内存、不修改游戏安装目录。
 
-local BRIDGE_VERSION = "1.1.1"
+local BRIDGE_VERSION = "1.2.0"
 local STATE_FILE = "krft_state.lua"
 local STATUS_FILE = "krft_status.txt"
 local HEARTBEAT_TIMEOUT = 6
@@ -55,6 +55,8 @@ local config = {
     -- 进度
     unlock_levels = false,
     three_stars = false,
+    -- 只读模式：完全不写游戏存档（见下方 read_only_active 说明）
+    read_only = false,
     cmd_skip_wave = 0,
     cmd_force_wave = 0,
     cmd_win = 0
@@ -545,7 +547,30 @@ local function apply_barracks(store)
     end
 end
 
+-- 只读模式（read_only = true）
+--
+-- 目的：完全不触碰存档文件，只做运行时内存修改。
+-- 适用场景：存档目录不可写、存档由第三方工具管理、或用户不希望修改器动存档。
+--
+-- 只读模式下：
+--   * 宝石 / 关卡解锁 / 全关三星 三项**强制关闭**，并在状态文件里回报原因
+--   * restore_slot_snapshot() 直接返回，永不调用 save_slot
+--   * 速度、金币、生命、伤害、射程、兵营、暂停、波次等纯运行时功能**不受影响**
+--     （它们本来就不写存档）
+--
+-- 注意：桥接脚本本身仍要写 krft_state.lua / krft_status.txt，
+-- 那两个是修改器自有文件，与游戏存档无关。
+local function read_only_active()
+    return config.active and config.read_only == true
+end
+
 local function restore_slot_snapshot()
+    -- 只读模式下绝不动存档：即使内存里还留着快照也直接丢弃
+    if read_only_active() then
+        slot_snapshot = nil
+        slot_snapshot_idx = nil
+        return
+    end
     if not slot_snapshot or not ok_storage then
         slot_snapshot = nil
         slot_snapshot_idx = nil
@@ -577,6 +602,14 @@ local function last_level_index()
 end
 
 local function apply_slot_features()
+    -- 只读模式下三项存档功能一律不执行
+    if read_only_active() then
+        if slot_snapshot then
+            slot_snapshot = nil
+            slot_snapshot_idx = nil
+        end
+        return
+    end
     local needs_slot = config.active and (config.gems_enabled or config.unlock_levels or config.three_stars)
     if not needs_slot or not ok_storage or not storage.active_slot_idx then
         if slot_snapshot and not needs_slot then
@@ -765,6 +798,9 @@ local function write_status(g)
         "restored=" .. (config.active and "0" or "1"),
         "kill_gold_hook=" .. (kill_gold_hook_ok and "1" or "0"),
         "barrack=" .. (config.barrack_enabled and "1" or "0"),
+        "read_only=" .. (config.read_only and "1" or "0"),
+        -- 只读模式下三项存档功能的强制关闭回报，便于界面提示用户
+        "slot_writable=" .. ((read_only_active()) and "0" or "1"),
         "speed=" .. tostring(clamp_number(config.speed, 1, 16, 1)),
         "last_level=" .. tostring(last_level_index()),
         "win_stage=" .. tostring(win_stage or -1),

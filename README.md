@@ -216,8 +216,8 @@ python -m pip install -r requirements.txt
 来执行真实的桥接脚本。
 
 ```bash
-python _test_bridge.py       # 桥接逻辑，44 项断言
-python _test_gui_smoke.py    # 界面冒烟，23 项断言
+python _test_bridge.py       # 桥接逻辑，55 项断言
+python _test_gui_smoke.py    # 界面冒烟，29 项断言
 python _test_launch.py       # 启动方式，39 项断言
 ```
 
@@ -305,6 +305,31 @@ set SteamAppId=458710
 | `extra_args` | string[] | 追加的自定义参数；写成单个字符串会自动包成数组 |
 | `use_steam_env` | bool | 设为 `false` 则不注入 `SteamAppId`/`SteamGameId` |
 
+#### 只读模式（不写游戏存档）
+
+进度页有「只读模式」开关。开启后修改器**完全不读写游戏存档**（`slot_*.lua`），
+宝石 / 解锁关卡 / 全关三星三项会自动禁用。
+
+**什么时候用**
+
+- 存档由其他工具管理，改动可能冲突
+- 存档目录不可写（权限受限）
+- 只想用运行时功能，不想动存档
+
+**不受影响的功能**（它们本来就不写存档）
+
+速度、暂停、锁定金币、锁定基地生命、杀敌金币倍率、友军无敌、英雄技能无冷却、
+伤害倍率、防御塔攻速 / 射程、兵营增强、提前呼叫下一波。
+
+**三层防护**
+
+1. 桥接侧 `read_only_active()` 短路，`apply_slot_features()` 直接返回，
+   `restore_slot_snapshot()` 永不调用 `save_slot`
+2. 界面侧三个 Checkbutton 置 `disabled`，切换时保存原值、关闭时恢复
+3. 状态文件写入前 `write_state()` 再次强制清零，快捷键旁路也会被拦
+
+状态文件里的 `slot_writable=0` 可用于确认当前处于只读状态。
+
 #### 优先级与回退
 
 **优先级**：界面上的选择是唯一决定因素。
@@ -376,8 +401,8 @@ set SteamAppId=458710
 | --------------------------------- | --------------------------------------- |
 | `KingdomRushFrontiersTrainer.pyw` | 界面主程序（源码）                               |
 | `krft_bridge.lua`                 | 在游戏 LuaJIT 环境中运行的桥接脚本                   |
-| `_test_bridge.py`                 | 桥接仿真测试（44 项断言，用游戏自带 `lua51.dll` 加载真实桥接） |
-| `_test_gui_smoke.py`              | 界面冒烟测试（23 项断言，真实构建 Tk 控件并驱动回调）          |
+| `_test_bridge.py`                 | 桥接仿真测试（55 项断言，用游戏自带 `lua51.dll` 加载真实桥接） |
+| `_test_gui_smoke.py`              | 界面冒烟测试（29 项断言，真实构建 Tk 控件并驱动回调）          |
 | `_test_launch.py`                 | 启动方式测试（39 项断言，覆盖两种方式的优先级与全部回退路径）    |
 
 ### 跑测试

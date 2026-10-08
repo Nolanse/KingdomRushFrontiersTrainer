@@ -32,7 +32,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Kingdom Rush Frontiers 专用修改器"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 APP_BUILD_DATE = "2026-10-03"
 APP_CREDITS = f"v{APP_VERSION} · {APP_BUILD_DATE}"
 
@@ -769,12 +769,19 @@ class TrainerApp:
             "barrack_respawn_scale": 1.0,
             "unlock_levels": False,
             "three_stars": False,
+            # 只读模式：不写游戏存档（存档由第三方工具管理 / 目录不可写时使用）
+            "read_only": False,
             "cmd_skip_wave": 0,
             "cmd_force_wave": 0,
             "cmd_win": 0,
         }
         self.toggles: dict[str, tk.BooleanVar] = {}
         self.values: dict[str, tk.DoubleVar] = {}
+        # 每个开关对应的 Checkbutton 控件（只读模式需要禁用）
+        self._toggle_widgets: dict[str, ttk.Checkbutton] = {}
+        self._slot_widgets: dict[str, ttk.Checkbutton] = {}
+        # 只读模式切换前后的开关原值，用于恢复
+        self._slot_backup: dict[str, bool] = {k: False for k in self.SLOT_FEATURES}
         self.hotkeys: dict[str, str] = dict(DEFAULT_HOTKEYS)
 
         self.save_dir = choose_save_dir()
@@ -898,6 +905,9 @@ class TrainerApp:
         self.toggles[key] = var
         box = ttk.Checkbutton(parent, text=label, variable=var, command=self.on_toggle)
         box.grid(row=row, column=0, sticky="w", pady=2)
+        self._toggle_widgets[key] = box
+        if key in self.SLOT_FEATURES:
+            self._slot_widgets[key] = box
         if help_text:
             ttk.Label(parent, text=help_text, style="Muted.TLabel").grid(row=row, column=1, sticky="w", padx=(12, 0))
         return var
@@ -1006,9 +1016,23 @@ class TrainerApp:
         grid = ttk.Frame(card)
         grid.pack(fill="x")
         grid.grid_columnconfigure(1, weight=1)
-        self.add_toggle(grid, 0, "unlock_levels", f"临时解锁全部关卡", f"1 – {FALLBACK_LAST_LEVEL}")
+        self.add_toggle(grid, 0, "unlock_levels", "临时解锁全部关卡", f"1 – {FALLBACK_LAST_LEVEL}")
         self.add_toggle(grid, 1, "three_stars", "临时全关三星")
-        ttk.Label(card, text="启用前会自动备份存档。", style="Muted.TLabel").pack(anchor="w")
+        self.add_toggle(grid, 2, "gems_enabled", "锁定宝石", "首次启用自动备份存档")
+        self.slot_hint = ttk.Label(card, text="启用前会自动备份存档。", style="Muted.TLabel")
+        self.slot_hint.pack(anchor="w")
+
+        # 只读模式：完全不动游戏存档
+        ro = self._card(tab, "只读模式")
+        ro_grid = ttk.Frame(ro)
+        ro_grid.pack(fill="x")
+        ro_grid.grid_columnconfigure(1, weight=1)
+        self.add_toggle(ro_grid, 0, "read_only", "只读模式（不写游戏存档）",
+                        "开启后宝石 / 解锁 / 三星自动禁用")
+        self.read_only_hint = ttk.Label(
+            ro, text="", style="Muted.TLabel", wraplength=640, justify="left")
+        self.read_only_hint.pack(anchor="w", pady=(4, 0))
+        self.refresh_read_only_ui()
 
         card2 = self._card(tab, "波次")
         grid2 = ttk.Frame(card2)
@@ -1136,6 +1160,10 @@ class TrainerApp:
             for key, (low, high) in self.CLAMP_RULES.items():
                 if key in self.state:
                     self.state[key] = self.clamp_float(self.state[key], low, high, low)
+            # 只读模式：存档类三项绝不外发（快捷键等旁路也要拦住）
+            if self.state.get("read_only"):
+                for key in self.SLOT_FEATURES:
+                    self.state[key] = False
             self.state["revision"] = int(self.state.get("revision", 0)) + 1
             self.state["heartbeat"] = int(time.time())
             atomic_write_text(self.save_dir / STATE_FILE, self.state_text())
@@ -1194,8 +1222,37 @@ class TrainerApp:
 
     SLOT_FEATURES = ("gems_enabled", "unlock_levels", "three_stars")
 
+    def refresh_read_only_ui(self) -> None:
+        """只读模式下禁用三个存档类开关并给出说明。"""
+        ro = bool(self.state.get("read_only"))
+        for key in self.SLOT_FEATURES:
+            var = self.toggles.get(key)
+            if var is None:
+                continue
+            if ro:
+                self._slot_backup[key] = bool(var.get())
+                var.set(False)
+            else:
+                var.set(self._slot_backup.get(key, False))
+            # ttk.Checkbutton 通过 state 属性控制可用性
+            self._slot_widgets[key].configure(state="disabled" if ro else "normal")
+        if ro:
+            self.read_only_hint.configure(
+                text="已启用：修改器不会读写游戏存档（slot_*..lua）。\n"
+                     "宝石 / 解锁关卡 / 全关三星已禁用；"
+                     "速度、伤害、射程、兵营、波次等运行时功能不受影响。",
+                style="Good.TLabel")
+            self.slot_hint.configure(text="只读模式下不可用。", style="Bad.TLabel")
+        else:
+            self.read_only_hint.configure(
+                text="关闭时若存档目录不可写或存档由其他工具管理，开启此模式可避免冲突。",
+                style="Muted.TLabel")
+            self.slot_hint.configure(text="启用前会自动备份存档。", style="Muted.TLabel")
+
     def ensure_backup(self) -> bool:
-        """存档类功能首次启用前自动备份。"""
+        """存档类功能首次启用前自动备份。只读模式下无需备份。"""
+        if bool(self.state.get("read_only")):
+            return True
         if self.backup_done:
             return True
         return self.backup_saves("auto") is not None
@@ -1498,7 +1555,22 @@ class TrainerApp:
     # ---------- 回调 ----------
     @guarded
     def on_toggle(self) -> None:
+        # 只读模式开关变化时，先做联动禁用/恢复
+        if self.toggles.get("read_only") is not None:
+            before = bool(self.state.get("read_only"))
+            self.state["read_only"] = bool(self.toggles["read_only"].get())
+            if before != self.state["read_only"]:
+                self.refresh_read_only_ui()
         self.collect_state()
+        # 只读模式下强制三项存档功能为关闭，防止被绕过界面写入
+        if self.state.get("read_only"):
+            for key in self.SLOT_FEATURES:
+                self.state[key] = False
+                if key in self.toggles:
+                    self.toggles[key].set(False)
+            self.write_state()
+            self.save_config()
+            return
         if any(self.state.get(key) for key in self.SLOT_FEATURES):
             if not self.ensure_backup():
                 # 备份失败则回滚这三个开关，避免改动存档
@@ -1589,6 +1661,10 @@ class TrainerApp:
             log_message("快捷键处理异常：\n" + traceback.format_exc())
 
     def _toggle_from_hotkey(self, key: str) -> None:
+        # 只读模式下存档类功能不可用，快捷键直接拒绝
+        if key in self.SLOT_FEATURES and bool(self.state.get("read_only")):
+            self.log(f"只读模式已启用，{HOTKEY_LABELS.get(key, key)} 不可用。")
+            return
         if key in self.SLOT_FEATURES and not bool(self.state.get(key)):
             if not self.ensure_backup():
                 return
