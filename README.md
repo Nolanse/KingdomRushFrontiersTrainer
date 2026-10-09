@@ -1,7 +1,7 @@
 # Kingdom Rush Frontiers 专用修改器 / Trainer
 
 ![platform](https://img.shields.io/badge/platform-Windows%20x64-blue)
-![version](https://img.shields.io/badge/version-1.3.1-green)
+![version](https://img.shields.io/badge/version-1.3.2-green)
 ![license](https://img.shields.io/badge/license-MIT-yellow)
 ![network](https://img.shields.io/badge/network-none-brightgreen)
 

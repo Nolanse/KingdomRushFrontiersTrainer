@@ -5,7 +5,7 @@
 -- 架构与 KR1 版一致：外部 GUI 写状态文件，本脚本在游戏自己的 LuaJIT 里读状态并改运行时数值。
 -- 不注入 DLL、不读写进程内存、不修改游戏安装目录。
 
-local BRIDGE_VERSION = "1.2.1"
+local BRIDGE_VERSION = "1.3.2"
 local STATE_FILE = "krft_state.lua"
 local STATUS_FILE = "krft_status.txt"
 local HEARTBEAT_TIMEOUT = 6
@@ -259,8 +259,55 @@ local function read_state()
     return result, nil
 end
 
+--- 兜底读取：状态文件写到游戏目录时用。
+--- love.filesystem.load 只能看见 save 目录，游戏目录那份要走原生 io 才能读到；
+--- 新版改了 identity 之后存档目录会变，此时 GUI 会把状态文件复制一份到游戏目录旁边。
+local function read_state_fallback()
+    if not io or not io.open then
+        return nil, "io unavailable"
+    end
+    local candidates = {
+        love and love.filesystem and love.filesystem.getSourceBaseDirectory and
+            love.filesystem.getSourceBaseDirectory() or "",
+        ".",
+    }
+    for _, base in ipairs(candidates) do
+        local path = base .. (base:sub(-1) == "\\" and "" or "\\") .. STATE_FILE
+        local handle = io.open(path, "rb")
+        if handle then
+            local chunk = handle:read("*a")
+            handle:close()
+            if type(chunk) == "string" and chunk ~= "" then
+                local loader, err = loadstring(chunk, "@" .. path)
+                if loader then
+                    local ok, result = pcall(loader)
+                    if ok and type(result) == "table" then
+                        return result, nil
+                    end
+                else
+                    return nil, err
+                end
+            end
+        end
+    end
+    return nil, "state file not found in source directory"
+end
+
+--- 先走 save 目录（正常路径），读不到再试游戏目录（identity 变更后的兜底）。
+local function read_state_any()
+    local result, err = read_state()
+    if result then
+        return result, nil
+    end
+    local alt, alt_err = read_state_fallback()
+    if alt then
+        return alt, nil
+    end
+    return nil, err or alt_err
+end
+
 local function refresh_config()
-    local incoming = read_state()
+    local incoming = read_state_any()
     if type(incoming) ~= "table" then
         -- 状态文件读失败（GUI 恰好在 os.replace 的瞬间被读到半截文件等），
         -- 不要立刻停用：保留上一帧配置继续生效，等下一次轮询（0.2s 后）重试。
@@ -811,8 +858,24 @@ local function write_status(g)
         "game_outcome=" .. ((g and g.store and g.store.game_outcome) and "1" or "0"),
         "timestamp=" .. tostring(os.time())
     }
+    local payload = table.concat(lines, "\n") .. "\n"
     pcall(function()
-        love.filesystem.write(STATUS_FILE, table.concat(lines, "\n") .. "\n")
+        love.filesystem.write(STATUS_FILE, payload)
+    end)
+    -- 游戏目录也留一份：GUI 在 identity 变更后可能把存档目录指向游戏目录旁边，
+    -- love.filesystem 只能写 save 目录，那份得用原生 io 补上。
+    pcall(function()
+        if not io or not io.open then
+            return
+        end
+        local base = love.filesystem.getSourceBaseDirectory and
+            love.filesystem.getSourceBaseDirectory() or "."
+        local path = base .. (base:sub(-1) == "\\" and "" or "\\") .. STATUS_FILE
+        local handle = io.open(path, "wb")
+        if handle then
+            handle:write(payload)
+            handle:close()
+        end
     end)
 end
 

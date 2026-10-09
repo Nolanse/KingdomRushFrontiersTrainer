@@ -32,8 +32,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Kingdom Rush Frontiers 专用修改器"
-APP_VERSION = "1.3.1"
-APP_BUILD_DATE = "2026-10-08"
+APP_VERSION = "1.3.2"
+APP_BUILD_DATE = "2026-10-09"
 APP_CREDITS = f"v{APP_VERSION} · {APP_BUILD_DATE}"
 
 # ---- 目标游戏参数（Frontiers = KR2，2026-10 实机提取确认）----
@@ -49,8 +49,23 @@ KNOWN_STEAM_APP_ID = 458710
 NON_STEAM_SEARCH_ROOTS = ("Desktop", "Downloads", "Documents")
 NON_STEAM_SEARCH_DEPTH = 2
 NON_STEAM_SEARCH_LIMIT = 800
-# identity = kingdom_rush_frontiers -> LÖVE 存档目录名
+# identity = kingdom_rush_frontiers -> LÖVE 存档目录名。
+# 这是旧版的假定值，仅作兜底；真实 identity 要从游戏 exe 里读出来（见 love_identity_dirs），
+# 因为新版可能改 bundle id / identity，届时 %APPDATA%\kingdom_rush_frontiers 就不再是存档目录。
 SAVE_DIR_NAME = "kingdom_rush_frontiers"
+# 历史 identity 候选：按可能性排序。新版换了 identity 时会同时命中多个，
+# 打分环节会挑出真正含存档特征文件的那一个。
+KNOWN_SAVE_DIR_NAMES = (
+    SAVE_DIR_NAME,
+    "kingdom_rush_frontiers_steam",
+    "kingdomrush_frontiers",
+    "com.ironhidegames.frontiers.windows.steam",
+    "com.ironhidegames.frontiers",
+    "frontiers",
+)
+# LÖVE 存档目录在 %APPDATA% 下可能多包一层 LOVE\（不同 identity 拼接规则）
+SAVE_DIR_PARENTS = ("", "LOVE")
+
 # 主线关卡 1..22（kr2/data/levels/ 下另有 level81/82/99 特殊关，不计入）
 FALLBACK_LAST_LEVEL = 22
 
@@ -175,23 +190,50 @@ def guarded(func):
 
 
 def candidate_save_dirs() -> list[Path]:
+    """所有已知 identity 组合出来的存档目录，按可能性排序。"""
     appdata = Path(os.environ.get("APPDATA", Path.home()))
-    return [
-        appdata / SAVE_DIR_NAME,
-        appdata / "LOVE" / SAVE_DIR_NAME,
-    ]
+    result: list[Path] = []
+    for name in KNOWN_SAVE_DIR_NAMES:
+        for parent in SAVE_DIR_PARENTS:
+            result.append(appdata / parent / name if parent else appdata / name)
+    return result
 
 
 # 判定一个目录「像不像本作存档目录」的特征文件
 SAVE_DIR_MARKERS = ("settings.lua", "global.lua", "krft_state.lua", "krft_status.txt")
 
 
+def love_identity_dirs(blob: bytes) -> list[str]:
+    """从游戏 exe 内嵌内容里提取 LÖVE identity 候选。
+
+    LÖVE 在 love.filesystem.setIdentity(id) 之后，把存档目录定成
+    %APPDATA%\\<id>\\save（新版则是 %APPDATA%\\<id>）。identity 写死在游戏代码里，
+    新版一旦改 bundle id / identity，%APPDATA%\\kingdom_rush_frontiers 就不再是存档目录，
+    桥接文件写进去游戏也读不到——表现为「module 'krft_bridge' not found」
+    且 require 的候选路径里完全不出现存档目录。
+
+    这里从 main.lua 的字节码常量表里扫出候选：与已知 identity 名单交叉，
+    再补充任意形如 com.xxx 的 bundle id，最后交给打分环节裁决。
+    """
+    found: list[str] = []
+    for name in KNOWN_SAVE_DIR_NAMES:
+        if name.encode() in blob:
+            found.append(name)
+    # 补扫 bundle id 形态（com.ironhidegames.frontiers.windows.steam 等）
+    for match in re.finditer(rb"com\.[a-z0-9_]+(?:\.[a-z0-9_]+)+", blob, re.I):
+        name = match.group(0).decode("ascii", "ignore").lower()
+        if name not in found:
+            found.append(name)
+    return found
+
+
 def discover_save_dirs() -> list[Path]:
     """列出本作可能使用的全部存档目录，按可能性从高到低。
 
-    除标准 identity 目录外，额外扫描 %APPDATA%\\LOVE\\* 与 %APPDATA%\\*kingdom*：
-    改了 bundle id / identity 的非官方构建会把存档落到别的目录名下，
-    只认死 SAVE_DIR_NAME 会出现「桥接写了文件，界面却读不到」的假死。
+    除标准 identity 目录外，额外扫描 %APPDATA%\\LOVE\\* 与 %APPDATA%\\*kingdom* /
+    *frontiers* / com.*：改了 bundle id / identity 的版本（含新版与第三方构建）
+    会把存档落到别的目录名下，只认死 SAVE_DIR_NAME 会出现
+    「桥接写了文件、游戏却找不到模块」的假死。
     """
     appdata = Path(os.environ.get("APPDATA", Path.home()))
     found: list[Path] = []
@@ -206,7 +248,7 @@ def discover_save_dirs() -> list[Path]:
 
     for path in candidate_save_dirs():
         add(path)
-    for pattern in ("LOVE/*", "*kingdom*", "*frontiers*"):
+    for pattern in ("LOVE/*", "*kingdom*", "*frontiers*", "*ironhide*", "com.*"):
         try:
             for child in sorted(appdata.glob(pattern)):
                 if child.is_dir():
@@ -238,16 +280,36 @@ def save_dir_score(path: Path) -> int:
     return score
 
 
-def choose_save_dir(override: str | Path | None = None) -> Path:
+def choose_save_dir(override: str | Path | None = None,
+                    game_path: str | Path | None = None) -> Path:
     """选出本次会话使用的存档目录。
 
-    优先级：override（launch.json 的 save_dir）→ 特征打分最高者 → 标准 identity 目录。
-    打分全为 0 时保持旧行为（优先存在的标准目录），绝不返回误导性的新目录。
+    优先级：override（launch.json 的 save_dir）→ 从游戏 exe 读出的 identity 目录
+    → 特征打分最高者 → 标准 identity 目录。打分全为 0 时保持旧行为（优先存在的
+    标准目录），绝不返回误导性的新目录。
+
+    game_path 用于在新版换了 identity 的情况下定位真实存档目录：
+    桥接文件必须落在游戏 setIdentity 指定的目录里，否则 require 不到模块。
     """
     if override:
         text = str(override).strip().strip('"')
         if text:
             return Path(text).expanduser()
+
+    identities = identities_from_game(game_path)
+    appdata = Path(os.environ.get("APPDATA", Path.home()))
+    for name in identities:
+        for parent in SAVE_DIR_PARENTS:
+            path = appdata / parent / name if parent else appdata / name
+            if save_dir_score(path) > 0:
+                return path
+            # 目录还不存在时也优先采用：游戏刚装、还没跑过，首启就要写对位置
+            try:
+                if path.is_dir():
+                    return path
+            except OSError:
+                continue
+
     for path in sorted(discover_save_dirs(), key=save_dir_score, reverse=True):
         if save_dir_score(path) > 0:
             return path
@@ -258,6 +320,19 @@ def choose_save_dir(override: str | Path | None = None) -> Path:
         except OSError:
             continue
     return candidate_save_dirs()[0]
+
+
+def identities_from_game(game_path: str | Path | None) -> list[str]:
+    """读取游戏 exe 里的 LÖVE identity 候选；读不到就退回历史名单。"""
+    if game_path:
+        try:
+            parsed = parse_game_binary(Path(game_path))
+            found = parsed.get("identities")
+            if isinstance(found, list) and found:
+                return [str(item) for item in found]
+        except OSError:
+            pass
+    return list(KNOWN_SAVE_DIR_NAMES)
 
 
 def steam_library_dirs() -> list[Path]:
@@ -644,6 +719,8 @@ def parse_game_binary(path: Path) -> dict[str, object]:
         result["bundle_ok"] = TARGET_BUNDLE_ID.encode() in version_blob
         # -custom_script 是整个方案的前提，必须确认
         result["custom_script"] = b"custom_script" in main_blob
+        # 新版可能改 identity，存档目录随之改变；把候选带出去给存档定位用
+        result["identities"] = love_identity_dirs(main_blob + version_blob)
         result["valid"] = bool(result["custom_script"]) and bool(result["version"] != "未知")
         if not result["custom_script"]:
             result["reason"] = "该版本未找到 -custom_script 入口，无法使用本修改器"
@@ -1026,10 +1103,11 @@ class TrainerApp:
         self._slot_backup: dict[str, bool | None] = {k: None for k in self.SLOT_FEATURES}
         self.hotkeys: dict[str, str] = dict(DEFAULT_HOTKEYS)
 
-        # 配置必须先读：存档目录覆盖与两个兼容性开关都来自配置文件
+        # 配置必须先读：存档目录覆盖与两个兼容性开关都来自配置文件。
+        # 先定位游戏再定存档目录——新版换了 identity 时必须按游戏 exe 里读出的身份选。
         self.load_config()
-        self.save_dir = choose_save_dir(getattr(self, "_saved_save_dir", None))
         self.game_path = locate_default_game()
+        self.save_dir = choose_save_dir(getattr(self, "_saved_save_dir", None), self.game_path)
         self.pid: int | None = None
         self.prepared = False
         self.backup_done = False
@@ -1420,11 +1498,19 @@ class TrainerApp:
 
         桥接用 love.filesystem.load() 加载后 pcall，裸赋值语句的 chunk 返回 nil，
         只有表格构造才会把配置表交回给桥接。
+
+        heartbeat 由这里统一覆盖写入：state 字典里也存着同名字段，若两处都输出，
+        生成的文件会出现重复键。Lua 构造式里重复键不报错但会静默取最后一个，
+        且新版 LuaJIT 对表构造的重复键检测更严格——统一在此处落笔，避免歧义。
         """
         lines = []
+        now = int(time.time())
         for key in sorted(self.state):
+            if key == "heartbeat":
+                continue
             lines.append(f"    {key} = {lua_literal(self.state[key])},")
-        lines.append(f"    heartbeat = {int(time.time())},")
+        lines.append(f"    heartbeat = {now},")
+        self.state["heartbeat"] = now
         return "return {\n" + "\n".join(lines) + "\n}\n"
 
     # 所有可写数值参数的合法区间。与 Lua 侧 clamp_number 的范围保持一致，
@@ -1454,35 +1540,95 @@ class TrainerApp:
                     self.state[key] = False
             self.state["revision"] = int(self.state.get("revision", 0)) + 1
             self.state["heartbeat"] = int(time.time())
-            atomic_write_text(self.save_dir / STATE_FILE, self.state_text())
+            payload = self.state_text()
+            # 桥接脚本可能在存档目录，也可能在游戏目录兜底；两处都写，
+            # 否则身份判定一旦偏差，功能开关全部哑火但界面毫无察觉。
+            errors: list[str] = []
+            for target in self.state_targets():
+                try:
+                    atomic_write_text(target, payload)
+                except OSError as exc:
+                    errors.append(f"{target}：{exc}")
             self.last_heartbeat = time.time()
+            if errors and not force:
+                self.log("部分状态写入位置失败：" + "；".join(errors))
         except OSError as exc:
             self.log(f"写入控制状态失败：{exc}")
 
+    def state_targets(self) -> list[Path]:
+        """状态文件的写入位置，与桥接脚本的落点保持一致。"""
+        targets = [self.save_dir / STATE_FILE]
+        try:
+            game_dir = Path(self.game_path_var.get().strip()).resolve().parent
+            game_target = game_dir / STATE_FILE
+            if game_target not in targets:
+                targets.append(game_target)
+        except (OSError, ValueError):
+            pass
+        return targets
+
     # ---------- 桥接准备 ----------
+    def bridge_targets(self) -> list[Path]:
+        """桥接脚本需要落到哪些目录。
+
+        首选是存档目录——LÖVE 把它算进 package.path，require 能找到。
+        但新版游戏若改了 identity、或存档目录尚未被创建，存档目录这条路会失效，
+        此时游戏目录本身也在 package.path 里（require 的候选里有 <游戏目录>\\krft_bridge.lua），
+        因此额外写一份到游戏目录兜底。
+
+        游戏目录通常需要写权限（Program Files 下会失败），失败只记日志不中断流程。
+        """
+        targets = [self.save_dir / BRIDGE_FILE]
+        try:
+            game_dir = Path(self.game_path_var.get().strip()).resolve().parent
+            game_target = game_dir / BRIDGE_FILE
+            if game_target not in targets:
+                targets.append(game_target)
+        except (OSError, ValueError):
+            pass
+        return targets
+
     def prepare_bridge(self) -> bool:
         source = resource_path(BRIDGE_FILE)
         if not source.is_file():
             messagebox.showerror(APP_NAME, f"缺少桥接脚本：\n{source}")
             return False
         try:
-            self.save_dir.mkdir(parents=True, exist_ok=True)
-            target = self.save_dir / BRIDGE_FILE
             source_data = source.read_bytes()
-            if target.exists() and target.read_bytes() != source_data:
-                backup_dir = self.save_dir / "KRFTBackups" / datetime.now().strftime("%Y%m%d-%H%M%S-bridge")
-                backup_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(target, backup_dir / target.name)
-                self.log(f"已备份旧桥接脚本：{backup_dir}")
-            target.write_bytes(source_data)
-            self.log(f"已写入桥接脚本：{target}")
-            self.prepared = True
-            self.state["active"] = True
-            self.write_state(force=True)
-            return True
         except OSError as exc:
-            messagebox.showerror(APP_NAME, f"无法准备桥接文件：\n{exc}")
+            messagebox.showerror(APP_NAME, f"无法读取桥接脚本：\n{exc}")
             return False
+
+        written = 0
+        errors: list[str] = []
+        for target in self.bridge_targets():
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists() and target.read_bytes() != source_data:
+                    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-bridge")
+                    backup_dir = target.parent / "KRFTBackups" / stamp
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(target, backup_dir / target.name)
+                    self.log(f"已备份旧桥接脚本：{backup_dir}")
+                target.write_bytes(source_data)
+                self.log(f"已写入桥接脚本：{target}")
+                written += 1
+            except OSError as exc:
+                # 游戏目录可能无写权限；存档目录写成功就够了，不因此中断
+                errors.append(f"{target}：{exc}")
+
+        if written == 0:
+            messagebox.showerror(
+                APP_NAME,
+                "无法准备桥接文件（所有候选目录都写入失败）：\n\n" + "\n".join(errors))
+            return False
+        for line in errors:
+            self.log(f"桥接脚本跳过该位置（不影响使用）：{line}")
+
+        self.prepared = True
+        self.state["active"] = True
+        self.write_state(force=True)
+        return True
 
     def backup_saves(self, reason: str) -> Path | None:
         try:
@@ -1631,7 +1777,9 @@ class TrainerApp:
         """
         override = launch_config_save_dir()
         previous = self.save_dir
-        self.save_dir = choose_save_dir(override)
+        # 重新检测时一并带上游戏路径：换了游戏版本（可能换 identity）后存档目录会变
+        game_path = self.game_path_var.get().strip() if self.game_path_var else None
+        self.save_dir = choose_save_dir(override, game_path)
         self.save_dir_var.set(str(self.save_dir))
         self.save_config()
         if override:
@@ -1928,8 +2076,40 @@ class TrainerApp:
         # 让出主线程，保持界面可响应
         self.root.after(400, self._verify_tick)
 
+    def status_targets(self) -> list[Path]:
+        """状态回报的可能位置：存档目录优先，游戏目录兜底（identity 变更场景）。"""
+        targets = [self.save_dir / STATUS_FILE]
+        try:
+            game_dir = Path(self.game_path_var.get().strip()).resolve().parent
+            game_target = game_dir / STATUS_FILE
+            if game_target not in targets:
+                targets.append(game_target)
+        except (OSError, ValueError):
+            pass
+        return targets
+
     def read_bridge_status(self) -> dict[str, str]:
-        return parse_status(self.save_dir / STATUS_FILE)
+        """读桥接上报，优先存档目录，取不到再试游戏目录那份。
+
+        identity 变更后 GUI 可能把存档目录指向游戏目录旁边，此时只有那一份是新的。
+        按 mtime 挑最新的一份，避免读到旧文件误判为「未加载桥接」。
+        """
+        best: dict[str, str] = {}
+        best_mtime = -1.0
+        for target in self.status_targets():
+            try:
+                if not target.is_file():
+                    continue
+                parsed = parse_status(target)
+                if not parsed:
+                    continue
+                mtime = target.stat().st_mtime
+                if mtime > best_mtime:
+                    best_mtime = mtime
+                    best = parsed
+            except OSError:
+                continue
+        return best
 
     def status_fresh(self, status: dict[str, str]) -> bool:
         return (time.time() - safe_int(status.get("timestamp"), 0)) < 8
